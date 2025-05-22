@@ -1,2 +1,2 @@
-# high_performance_jax
-Tutorials and recipes for high performance in Jax
+# High Performance Jax
+Tutorials and recipes for achieving high performance with Jax
