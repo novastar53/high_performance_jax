@@ -17,6 +17,9 @@ def matmul(A, B):
 
 
 def main():
+
+    print(jax.devices())
+
     dim = 2**14
     A = jnp.ones((dim, dim))
     B = jnp.ones((dim, dim))

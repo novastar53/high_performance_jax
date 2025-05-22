@@ -5,8 +5,10 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = "==3.12.8"
 dependencies = [
+    "cloud-tpu-client>=0.10",
     "deepkit",
     "jax==0.5.2",
+    "libtpu",
     "tensorboard-plugin-profile>=2.19.5",
     "tensorflow>=2.19.0",
 ]
@@ -21,3 +23,4 @@ metal = [
 
 [tool.uv.sources]
 deepkit = { path = "../deepkit/dist/deepkit-0.1.0-py3-none-any.whl" }
+libtpu = { path = "libtpu-0.0.16.dev20250522+nightly-py3-none-manylinux_2_31_x86_64.whl" }
