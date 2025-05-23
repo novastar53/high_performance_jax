@@ -40,4 +40,6 @@ def matadd3(A, B, C):
 def matmul(A, B):
     return A @ B
 
+def matmul3(A, B, C):
+    return A @ B @ C
 
