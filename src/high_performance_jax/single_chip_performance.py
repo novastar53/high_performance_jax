@@ -20,7 +20,7 @@ def measure_tpu_flops(op, dim):
         case "matadd":
             return dim**2
         case "matadd3":
-            return dim**3
+            return 2*dim**2
         case "matmul":
             return (dim**2)*(2*dim - 1)
         case _:
