@@ -1,33 +1,28 @@
-import matplotlib.pyplot as plt
-from datetime import datetime
-import random
-import string
-import jax
 import jax.numpy as jnp
 
 
-from deepkit.utils import timeit
 
-def measure_tpu_hbm_memory_transfer(A, B, op, dtype):
+def measure_tpu_hbm_memory_transfer(op, dim, dtype):
     bytes = jnp.dtype(dtype).itemsize
 
     match op:
         case "matadd":
-            return 3 * A.size * bytes 
+            return 3 * dim * bytes 
+        case "matadd3":
+            return 6 * dim * bytes 
         case "matmul":
-            return (A.size + B.size + A.shape[0]*B.shape[1]) * bytes
+            return 3 * (dim**2) * bytes
         case _:
             return 0
 
-def measure_tpu_flops(A, B, op):
+def measure_tpu_flops(op, dim):
     match op:
         case "matadd":
-            M, N = A.shape
-            return M * N
+            return dim ** 2
+        case "matadd3":
+            return dim ** 3
         case "matmul":
-            M, N = A.shape
-            N, P = B.shape
-            return M*P*(2*N - 1)
+            return (dim**2)*(2*dim - 1)
         case _:
             return 0
 
@@ -35,6 +30,8 @@ def measure_tpu_flops(A, B, op):
 def matadd(A, B):
     return A + B
 
+def matadd3(A, B, C):
+    return A + B + C
 
 def matmul(A, B):
     return A @ B
