@@ -22,7 +22,8 @@ def measure_tpu_hbm_memory_transfer(A, B, op, dtype):
 def measure_tpu_flops(A, B, op):
     match op:
         case "matadd":
-            return (A.size + B.size)
+            M, N = A.shape
+            return M * N
         case "matmul":
             M, N = A.shape
             N, P = B.shape
