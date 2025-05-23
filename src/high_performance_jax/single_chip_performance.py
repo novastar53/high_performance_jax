@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 from datetime import datetime
 import random
-import stringhttps://www.youtube.com/watch?v=RciT5fcuN1E
+import string
 import jax
 import jax.numpy as jnp
 
