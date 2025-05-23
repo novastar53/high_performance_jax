@@ -12,6 +12,8 @@ def measure_tpu_hbm_memory_transfer(op, dim, dtype):
             return 6 * (dim**2) * bytes 
         case "matmul":
             return 3 * (dim**2) * bytes
+        case "matmul3":
+            return 6 * (dim**2) * bytes
         case _:
             return 0
 
@@ -23,6 +25,8 @@ def measure_tpu_flops(op, dim):
             return 2*dim**2
         case "matmul":
             return (dim**2)*(2*dim - 1)
+        case "matmul3":
+            return 2*(dim**2)*(2*dim - 1)
         case _:
             return 0
 
