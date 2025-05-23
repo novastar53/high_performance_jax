@@ -23,4 +23,4 @@ metal = [
 
 [tool.uv.sources]
 deepkit = { path = "../deepkit/dist/deepkit-0.1.0-py3-none-any.whl" }
-libtpu = { path = "libtpu-0.0.16.dev20250522+nightly-py3-none-manylinux_2_31_x86_64.whl" }
+libtpu = { url = "https://storage.googleapis.com/libtpu-nightly-releases/wheels/libtpu/libtpu-0.0.16.dev20250522+nightly-py3-none-manylinux_2_31_x86_64.whl" }
