@@ -1,3 +1,7 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "high-performance-jax"
 version = "0.1.0"
@@ -5,10 +9,8 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = "==3.12.8"
 dependencies = [
-    "cloud-tpu-client>=0.10",
     "deepkit",
     "jax==0.5.2",
-    "libtpu",
     "tensorboard-plugin-profile>=2.19.5",
     "tensorflow>=2.19.0",
 ]
@@ -17,10 +19,18 @@ dependencies = [
 cuda = [
     "jax[cuda12_pip]==0.5.2",
 ]
-metal = [
-    "jax>=0.5.2",
+tpu = [
+    "libtpu",
+    "cloud-tpu-client>=0.10",
+]
+dev = [
+    "high-performance-jax",
 ]
 
+[tool.hatch.build]
+packages = ["src/high_performance_jax"]
+
 [tool.uv.sources]
-deepkit = { path = "../deepkit/dist/deepkit-0.1.0-py3-none-any.whl" }
 libtpu = { url = "https://storage.googleapis.com/libtpu-nightly-releases/wheels/libtpu/libtpu-0.0.16.dev20250522+nightly-py3-none-manylinux_2_31_x86_64.whl" }
+deepkit = { git = "https://github.com/novastar53/deepkit.git" }
+high-performance-jax = { workspace = true }

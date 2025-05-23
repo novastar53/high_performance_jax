@@ -1,5 +1,4 @@
 version = 1
-revision = 1
 requires-python = "==3.12.8"
 
 [[package]]
@@ -286,25 +285,13 @@ wheels = [
 [[package]]
 name = "deepkit"
 version = "0.1.0"
-source = { path = "../deepkit/dist/deepkit-0.1.0-py3-none-any.whl" }
+source = { git = "https://github.com/novastar53/deepkit.git#074a0f6a594e932e5306d4b3c9f975858eecbb3b" }
 dependencies = [
     { name = "flax" },
     { name = "ipykernel" },
     { name = "jax" },
     { name = "seaborn" },
     { name = "torchvision" },
-]
-wheels = [
-    { filename = "deepkit-0.1.0-py3-none-any.whl", hash = "sha256:593a6450fb14d477be6b3500c8ff9afdc2107591948a1af711a01e34bf033387" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "flax", specifier = "==0.10.4" },
-    { name = "ipykernel", specifier = ">=6.29.5" },
-    { name = "jax", specifier = "==0.5.2" },
-    { name = "seaborn", specifier = ">=0.13.2" },
-    { name = "torchvision", specifier = ">=0.21.0" },
 ]
 
 [[package]]
@@ -659,12 +646,10 @@ wheels = [
 [[package]]
 name = "high-performance-jax"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
-    { name = "cloud-tpu-client" },
     { name = "deepkit" },
     { name = "jax" },
-    { name = "libtpu" },
     { name = "tensorboard-plugin-profile" },
     { name = "tensorflow" },
 ]
@@ -673,22 +658,22 @@ dependencies = [
 cuda = [
     { name = "jax", extra = ["cuda12-pip"] },
 ]
-metal = [
-    { name = "jax" },
+tpu = [
+    { name = "cloud-tpu-client" },
+    { name = "libtpu" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "cloud-tpu-client", specifier = ">=0.10" },
-    { name = "deepkit", path = "../deepkit/dist/deepkit-0.1.0-py3-none-any.whl" },
+    { name = "cloud-tpu-client", marker = "extra == 'tpu'", specifier = ">=0.10" },
+    { name = "deepkit", git = "https://github.com/novastar53/deepkit.git" },
+    { name = "high-performance-jax", marker = "extra == 'dev'", editable = "." },
     { name = "jax", specifier = "==0.5.2" },
-    { name = "jax", marker = "extra == 'metal'", specifier = ">=0.5.2" },
     { name = "jax", extras = ["cuda12-pip"], marker = "extra == 'cuda'", specifier = "==0.5.2" },
-    { name = "libtpu", url = "https://storage.googleapis.com/libtpu-nightly-releases/wheels/libtpu/libtpu-0.0.16.dev20250522+nightly-py3-none-manylinux_2_31_x86_64.whl" },
+    { name = "libtpu", marker = "extra == 'tpu'", url = "https://storage.googleapis.com/libtpu-nightly-releases/wheels/libtpu/libtpu-0.0.16.dev20250522+nightly-py3-none-manylinux_2_31_x86_64.whl" },
     { name = "tensorboard-plugin-profile", specifier = ">=2.19.5" },
     { name = "tensorflow", specifier = ">=2.19.0" },
 ]
-provides-extras = ["cuda", "metal"]
 
 [[package]]
 name = "httplib2"
