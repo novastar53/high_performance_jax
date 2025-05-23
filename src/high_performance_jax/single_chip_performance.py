@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 from datetime import datetime
 import random
-import string
+import stringhttps://www.youtube.com/watch?v=RciT5fcuN1E
 import jax
 import jax.numpy as jnp
 
@@ -13,7 +13,7 @@ def measure_tpu_hbm_memory_transfer(A, B, op, dtype):
 
     match op:
         case "matadd":
-            return 3 * (A.size + B.size) * bytes 
+            return 3 * A.size * bytes 
         case "matmul":
             return (A.size + B.size + A.shape[0]*B.shape[1]) * bytes
         case _:
