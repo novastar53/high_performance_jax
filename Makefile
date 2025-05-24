@@ -13,13 +13,13 @@ ifeq ($(UNAME_S),Darwin)
         JAX_PLATFORM = metal
     else
         ifeq ($(UNAME_M),x86_64)
-            JAX_PLATFORM = cuda
+            JAX_PLATFORM = tpu
         else
             $(error Unsupported architecture: $(UNAME_M))
         endif
     endif
 else
-    JAX_PLATFORM = cuda
+    JAX_PLATFORM = tpu
 endif
 
 print-platform:
