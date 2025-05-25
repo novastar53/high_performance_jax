@@ -97,7 +97,7 @@ jupyter-ssh-tunnel:
 lab:
 	cd notebooks && nohup uv run jupyter lab --NotebookApp.iopub_data_rate_limit=1.0e10 --NotebookApp.rate_limit_window=10.0 --no-browser --port=8888 > jupyter.log 2>&1 &
 	sleep 3
-	jupyter server list 
+	uv run jupyter server list 
 
 # Help command
 help:
