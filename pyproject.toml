@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-cuda = [
+gpu = [
     "jax[cuda12_pip]==0.5.2",
 ]
 tpu = [
