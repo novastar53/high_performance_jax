@@ -96,7 +96,7 @@ list:
 	uv pip list
 
 jupyter-ssh-tunnel:
-	ssh -L 8888:localhost:8888 -i '${k}' ubuntu@${h}
+	ssh -L 8888:localhost:8888 -L 6006:localhost:6006 -i '${k}' ubuntu@${h}
 
 # Run Jupyter lab
 lab:
