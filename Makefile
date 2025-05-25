@@ -13,7 +13,11 @@ ifeq ($(UNAME_S),Darwin)
         JAX_PLATFORM = metal
     else
         ifeq ($(UNAME_M),x86_64)
-            JAX_PLATFORM = tpu
+            ifeq ($(shell command -v nvidia-smi > /dev/null 2>&1 && echo yes),yes)
+                JAX_PLATFORM = gpu
+            else
+                JAX_PLATFORM = tpu
+            endif
         else
             $(error Unsupported architecture: $(UNAME_M))
         endif
@@ -26,7 +30,8 @@ print-platform:
 	@echo "JAX_PLATFORM: $(JAX_PLATFORM)"
 
 # Install dependencies from lockfile with platform-specific JAX
-install:	
+install:
+	@command -v uv >/dev/null 2>&1 || (curl -LsSf https://astral.sh/uv/install.sh | sh)
 	uv sync --extra $(JAX_PLATFORM)
 
 # Install development dependencies
