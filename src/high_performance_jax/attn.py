@@ -130,7 +130,7 @@ def bench_nnx_mha(batch: int, seq_len: int, heads: int, head_dim: int, warmup: i
     return statistics.mean(timings), statistics.stdev(timings) if len(timings) > 1 else 0.0
 
 
-def compare(batch=4, seq_len=512, heads=8, head_dim=64, warmup: int = 2, runs: int = 5):
+def compare(batch=32, seq_len=4096, heads=8, head_dim=256, warmup: int = 2, runs: int = 10):
     print(f'Parameters: batch={batch}, seq_len={seq_len}, heads={heads}, head_dim={head_dim}')
     dp_mean, dp_std = bench_dot_product(batch, seq_len, heads, head_dim, warmup=warmup, runs=runs)
     print(f'jax.nn.dot_product_attention: mean={dp_mean:.2f} ms std={dp_std:.2f} ms')
