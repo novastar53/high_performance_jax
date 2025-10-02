@@ -11,19 +11,25 @@ UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
     ifeq ($(UNAME_M),arm64)
         JAX_PLATFORM = metal
-    else
-        ifeq ($(UNAME_M),x86_64)
-            ifeq ($(shell command -v nvidia-smi > /dev/null 2>&1 && echo yes),yes)
-                JAX_PLATFORM = gpu
-            else
-                JAX_PLATFORM = tpu
-            endif
+    else ifeq ($(UNAME_M),x86_64)
+        ifeq ($(shell command -v nvidia-smi > /dev/null 2>&1 && echo yes),yes)
+            JAX_PLATFORM = gpu
         else
-            $(error Unsupported architecture: $(UNAME_M))
+            JAX_PLATFORM = tpu
         endif
+    else
+        $(error Unsupported architecture: $(UNAME_M))
+    endif
+else ifeq ($(UNAME_S),Linux)
+    ifeq ($(shell command -v nvidia-smi > /dev/null 2>&1 && echo yes),yes)
+        JAX_PLATFORM = gpu
+    else ifeq ($(shell command -v rocminfo > /dev/null 2>&1 && echo yes),yes)
+        JAX_PLATFORM = gpu
+    else
+        JAX_PLATFORM = tpu
     endif
 else
-    JAX_PLATFORM = tpu
+    $(error Unsupported operating system: $(UNAME_S))
 endif
 
 print-platform:
