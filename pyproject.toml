@@ -16,12 +16,12 @@ dependencies = [
     "jupyter>=1.1.1",
     "ipykernel>=6.29.5",
     "tqdm>=4.67.1",
-    "triton>=3.3.0 ; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]
 gpu = [
     "jax[cuda12_pip]==0.5.2",
+    "triton>=3.3.0 ; sys_platform == 'linux'",
 ]
 tpu = [
     "libtpu",
