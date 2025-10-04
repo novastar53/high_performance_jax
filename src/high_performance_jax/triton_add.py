@@ -13,7 +13,7 @@ def add_kernel(x_ptr,
     pid = tl.program_id(axis=0)
     block_start = pid * BLOCKSIZE
     offsets = block_start + tl.arange(0, BLOCKSIZE)
-    mask = offsets < n_elements
+    mask = tl.full_like(offsets, 1) # > n_elements
 
     x = tl.load(x_ptr + offsets, mask=mask)
     y = tl.load(y_ptr + offsets, mask=mask)
@@ -28,7 +28,7 @@ def add(x: torch.Tensor, y: torch.Tensor):
     output = torch.empty_like(x) 
     assert x.is_cuda and y.is_cuda and output.is_cuda
     n_elements = output.numel()
-    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCKSIZE']),)
     add_kernel[grid](x, y, output, n_elements, BLOCKSIZE=1024)
     return output
 
