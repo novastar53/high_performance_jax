@@ -12,7 +12,7 @@ for i in range(len(x)):
 
 result = jnp.exp(x - max_x) / z
 standard_result = jax.nn.softmax(x)
-print(jnp.allclose(result, standard_result))
+assert(jnp.allclose(result, standard_result))
 
 
 def print_grid(N, filled_cells):
@@ -50,11 +50,23 @@ v = jax.random.randint(
     (N, D), -5, 5
 )
 
+
 # regular attention
 a = jnp.einsum('nd,md->nm', q, k)
 a = jax.nn.softmax(a, axis=-1)
-o = jnp.einsum('nm,md->nd', a, v)
-print(o.shape)
+ref_result = jnp.einsum('nm,md->nd', a, v)
+
+
+# manual attention
+s = q @ k.T
+manual_m = jnp.max(s, axis=-1)
+s = s - manual_m[..., None]
+manual_p = jnp.exp(s)
+manual_z = jnp.sum(manual_p, axis=-1)
+manual_result_unnorm = manual_p @ v
+manual_result = manual_result_unnorm / manual_z[..., None]
+
+assert(jnp.allclose(ref_result, manual_result))
 
 
 # flash attention (python)
@@ -76,22 +88,17 @@ for row in range(n_blocks):
         s_blk = q_blk @ k_blk
         m_blk_old = m_blk
         m_blk = jnp.maximum(m_blk, jnp.max(s_blk, axis=-1))
-        p_blk = jnp.exp(s_blk - m_blk)
+        p_blk = jnp.exp(s_blk - m_blk[..., None])
         z_blk = z_blk*jnp.exp(m_blk_old - m_blk) + jnp.sum(p_blk, axis=-1)
-        p = p_blk @ v_blk
-        result_blk = (jnp.eye(block_size,) * jnp.exp(m_blk - m_blk_old)) @ result_blk + p
+        r = p_blk @ v_blk
+        result_blk = ((jnp.eye(block_size,) * jnp.exp(m_blk_old - m_blk))) @ result_blk + r
         computed_blocks.append((row, col))
-        #print_grid(n_blocks, computed_blocks)
-        #print("-----")
     m = m.at[row*block_size:(row+1)*block_size].set(m_blk)
     z = z.at[row*block_size:(row+1)*block_size].set(z_blk)
     result = result.at[row*block_size:(row+1)*block_size, :].set(result_blk)
 
-#result = jnp.exp(result - jnp.eye(N, N) * jnp.max(result, axis=-1))
-#z = jnp.sum(result, axis=-1)
 result /= z[..., None]
 
-s = q @ k.T
-p = jax.nn.softmax(s, axis=-1)
-test_result = p @ v
-print(jnp.allclose(result, test_result))
+assert(jnp.allclose(m, manual_m))
+assert(jnp.allclose(z, manual_z))
+assert(jnp.allclose(result, manual_result))
