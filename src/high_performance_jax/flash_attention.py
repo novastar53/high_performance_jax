@@ -88,17 +88,26 @@ for row in range(n_blocks):
         s_blk = q_blk @ k_blk
         m_blk_old = m_blk
         m_blk = jnp.maximum(m_blk, jnp.max(s_blk, axis=-1))
+        correction_factor = jnp.exp(m_blk_old - m_blk)
         p_blk = jnp.exp(s_blk - m_blk[..., None])
-        z_blk = z_blk*jnp.exp(m_blk_old - m_blk) + jnp.sum(p_blk, axis=-1)
+        z_blk = z_blk * correction_factor + jnp.sum(p_blk, axis=-1)
         r = p_blk @ v_blk
-        result_blk = ((jnp.eye(block_size,) * jnp.exp(m_blk_old - m_blk))) @ result_blk + r
-        computed_blocks.append((row, col))
+        result_blk = result_blk * correction_factor[..., None] + r
     m = m.at[row*block_size:(row+1)*block_size].set(m_blk)
     z = z.at[row*block_size:(row+1)*block_size].set(z_blk)
     result = result.at[row*block_size:(row+1)*block_size, :].set(result_blk)
 
-result /= z[..., None]
 
 assert(jnp.allclose(m, manual_m))
 assert(jnp.allclose(z, manual_z))
+assert(jnp.allclose(result, manual_result_unnorm))
+result /= z[..., None]
 assert(jnp.allclose(result, manual_result))
+
+
+# flash attention (triton)
+# TODO
+
+
+# flash attention (pallas)
+# TODO
