@@ -169,6 +169,23 @@ def _attn_fwd_inner(
         # This is the correction factor for the previous l_i
         alpha = tl.math.exp(m_i - m_ij)
 
+        # Apply the correction factor to the previous l_i and and the new l_ij
+        l_i = l_i * alpha + l_ij
+
+        V_block = tl.load(V_block_ptr)
+        P_block = P_block.to(tl.float16)
+
+        # This computes the following: Q_new = P x V + O_old * alpha
+        O_block = O_block * alpha[:, None]
+        O_block = tl.dot(P_block, V_block, O_block) # O_block += P_block @ V_block
+
+        m_i = m_ij 
+
+        # Move to the next block of K and V
+        V_block_ptr = tl.advance(V_block_ptr, (BLOCK_SIZE_KV, 0)) # V[SEQ_LEN, HEAD_DIM]
+        K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_SIZE_KV)) # # K[HEAD_DIM, SEQ_LEN]
+
+
 
 @triton.jit
 def _attn_fwd(
@@ -324,6 +341,34 @@ def _attn_fwd(
             SEQ_LEN,
         )
 
+    m_i += tl.math.log(l_i) # This is needed to compute the logsumexp for the backwards pass
+
+    O_block = O_block / l_i[i, None]
+    m_ptrs = M + index_batch_head * SEQ_LEN + offs_q
+    tl.store(m_ptrs, m_i)
+    tl.store(O_block_ptr, O_block.to(O.type.element_ty))
+
+@triton.jit
+def _attn_bwd_preprocess(
+    O,
+    dO,
+    D,
+    SEQ_LEN,
+    BLOCK_SIZE_Q: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    block_index_q = tl.program_id(0)
+    offs_q = block_index_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+    index_batch_head = tl.program_id(1)
+    offs_dim = tl.arange(0, HEAD_DIM)
+
+    # Load a single block of BLOCK_SIZE_Q rows of O
+    O_block = tl.load( # O [BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM]
+        O
+        + index_batch_head * HEAD_DIM * SEQ_LEN
+        + offs_q[:, None] * HEAD_DIM
+        + offs_dim[None, :]
+    ) # (BLOCK_SIZEQ, HEAD_DIM)
 
 class TritonAttention(torch.autograd.Function):
 
@@ -381,6 +426,34 @@ class TritonAttention(torch.autograd.Function):
         ctx.HEAD_DIM = HEAD_DIM_K
         ctx.causal = causal
         return 0
+    
+    @staticmethod
+    def backward(ctx, dO):
+        Q, K, V, O, M = ctx.saved_tensors
+
+        assert dO.is_contiguous()
+        assert Q.stride() == K.stride() == V.stride() == O.stride() == dO.stride()
+
+        dQ = torch.empty_like(Q)
+        dK = torch.empty_like(K)
+        dV = torch.empty_like(V)
+
+        BATCH_SIZE, NUM_HEADS, SEQ_LEN = Q.shape[:3]
+        NUM_WARPS, NUM_STAGES = 4, 3
+        BLOCK_SIZE_MICRO, BLOCK_SIZE_MACRO = 32, 128
+
+        preprocess_grid = (SEQ_LEN // BLOCK_SIZE_MACRO, BATCH_SIZE * NUM_HEADS)
+        D = torch.empty_like(M) # Shape: (BATCH_SIZE, NUM_HEADS, SEQ_LEN)
+
+        # Compute all the elements Di
+        _attn_bwd_preprocess[preprocess_grid](
+            O=O,
+            dO=dO,
+            D=D,
+            SEQ_LEN=SEQ_LEN,
+            BLOCK_SIZE_Q=BLOCK_SIZE_MACRO,
+            HEAD_DIM=ctx.HEAD_DIM,
+        )
 
 
 def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float16):
