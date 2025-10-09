@@ -52,13 +52,13 @@ v = jax.random.randint(
 
 
 # regular attention
-a = jnp.einsum('nd,md->nm', q, k)
+a = jnp.einsum('nd,md->nm', q, k) / jnp.sqrt(D)
 a = jax.nn.softmax(a, axis=-1)
 ref_result = jnp.einsum('nm,md->nd', a, v)
 
 
 # manual attention
-s = q @ k.T
+s = q @ k.T / jnp.sqrt(D)
 manual_m = jnp.max(s, axis=-1)
 s = s - manual_m[..., None]
 manual_p = jnp.exp(s)
@@ -85,7 +85,7 @@ for row in range(n_blocks):
     for col in range(n_blocks):
         k_blk = k.T[:, col*block_size:(col+1)*block_size] 
         v_blk = v[col*block_size:(col+1)*block_size, :]
-        s_blk = q_blk @ k_blk
+        s_blk = q_blk @ k_blk / jnp.sqrt(D)
         m_blk_old = m_blk
         m_blk = jnp.maximum(m_blk, jnp.max(s_blk, axis=-1))
         correction_factor = jnp.exp(m_blk_old - m_blk)
@@ -105,7 +105,7 @@ result /= z[..., None]
 assert(jnp.allclose(result, manual_result))
 
 
-
+'''
 # flash attention (triton)
 import torch
 import triton
@@ -370,6 +370,14 @@ def _attn_bwd_preprocess(
         + offs_dim[None, :]
     ) # (BLOCK_SIZEQ, HEAD_DIM)
 
+    # Load a single block of BLOCK_SIZE_Q rows of DO
+    dO_block = tl.load(
+        dO
+        + index_batch_head * HEAD_DIM * SEQ_LEN
+        + offs_q[:, None] * HEAD_DIM
+    )
+
+
 class TritonAttention(torch.autograd.Function):
 
     @staticmethod
@@ -527,3 +535,4 @@ def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float1
 
 # flash attention (pallas)
 # TODO
+'''
