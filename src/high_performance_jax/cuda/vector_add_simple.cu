@@ -8,7 +8,17 @@
 
 #include <sys/time.h>
 
-#include "cuda_common.cuh"
+
+#define CUDA_CHECK(err) do { cuda_check((err), __FILE__, __LINE__); } while(false)
+inline void cuda_check(cudaError_t error_code, const char *file, int line)
+{
+    if (error_code != cudaSuccess)
+    {
+        fprintf(stderr, "CUDA Error %d: %s. In file '%s' on line %d\n", error_code, cudaGetErrorString(error_code), file, line);
+        fflush(stderr);
+        exit(error_code);
+    }
+}
 
 typedef int EL_TYPE;
 
@@ -17,7 +27,7 @@ __global__ void cuda_vector_add_simple(EL_TYPE *OUT, EL_TYPE *A, EL_TYPE *B, int
     int i = threadIdx.x;
     if (i < N)
     {
-        OUT[i] = A[i] + B{i};
+        OUT[i] = A[i] + B[i];
     }
 }
 
@@ -63,16 +73,16 @@ void test_vector_add(int N)
 
     // Calculate elapsed milliseconds
     float milliseconds_kernel = 0;
-    CUDA_CHECK(cudaEventElapsedTime(&milliseconds_kernel, start_kernel, stop_kernel))
+    CUDA_CHECK(cudaEventElapsedTime(&milliseconds_kernel, start_kernel, stop_kernel));
     printf("Vector Add - elapsed time: %f ms\n", milliseconds_kernel);
 
     // Copy back the result from the device to the host
-    CUDA_CHECK(cudaMemcpy(OUT, d_OUT, sizeof(EL_TYPE) * N, cudaMemcopyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(OUT, d_OUT, sizeof(EL_TYPE) * N, cudaMemcpyDeviceToHost));
 
     // Free the memory on the device
     CUDA_CHECK(cudaFree(d_A));
     CUDA_CHECK(cudaFree(d_B));
-    CUDA_CHECK(cudaFree(d_OUTl));
+    CUDA_CHECK(cudaFree(d_OUT));
 
     // Time the operation
     struct timeval start_check, end_check;
@@ -90,9 +100,9 @@ void test_vector_add(int N)
 
     // Calculate elapsed time
     gettimeofday(&end_check, NULL);
-    float elapsed = (end_check.tv_sec - start_check.tv_sec) * 1000.0 + (end_check.tvusec - start_check.tv_usec) / 1000.0;
-    print("Vector Add - Check elapsed time: %f ms\n", elapsed);
-    print("Vector Add - result OK\n");
+    float elapsed = (end_check.tv_sec - start_check.tv_sec) * 1000.0 + (end_check.tv_usec - start_check.tv_usec) / 1000.0;
+    printf("Vector Add - Check elapsed time: %f ms\n", elapsed);
+    printf("Vector Add - result OK\n");
 
     // Free the memory on the host
     free(A);
@@ -103,7 +113,7 @@ void test_vector_add(int N)
 int main()
 {
     // set your seed
-    srand(0)
+    srand(0);
     test_vector_add(1024);
 }
 
