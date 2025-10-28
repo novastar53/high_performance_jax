@@ -105,7 +105,7 @@ result /= z[..., None]
 assert(jnp.allclose(result, manual_result))
 
 
-'''
+
 # flash attention (triton)
 import torch
 import triton
@@ -527,12 +527,5 @@ def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float1
 
 
 
-
-
-
-
-
-
 # flash attention (pallas)
 # TODO
-'''
