@@ -140,7 +140,7 @@ def _attn_fwd_inner(
     V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
 
     # loop over k, v and update accumulator
-    for start_kv in range(lo, hi, BlOCK_SIZE_KV):
+    for start_kv in range(lo, hi, BLOCK_SIZE_KV):
         # Just let the compiler know that start_n 
         # is a multiple of BLOCCK_N, 
         # so the compiler can do optimizations
