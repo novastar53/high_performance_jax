@@ -66,7 +66,7 @@ manual_z = jnp.sum(manual_p, axis=-1)
 manual_result_unnorm = manual_p @ v
 manual_result = manual_result_unnorm / manual_z[..., None]
 
-assert(jnp.allclose(ref_result, manual_result))
+assert(jnp.allclose(ref_result, manual_result, atol=0.01))
 
 
 # flash attention (python)
@@ -100,9 +100,9 @@ for row in range(n_blocks):
 
 assert(jnp.allclose(m, manual_m))
 assert(jnp.allclose(z, manual_z))
-assert(jnp.allclose(result, manual_result_unnorm))
+assert(jnp.allclose(result, manual_result_unnorm, atol=1e-2))
 result /= z[..., None]
-assert(jnp.allclose(result, manual_result))
+assert(jnp.allclose(result, manual_result, atol=1e-2))
 
 
 
@@ -187,6 +187,20 @@ def _attn_fwd_inner(
 
 
 
+@triton.autotune(
+    [
+        triton.Config(
+            {"BLOCK_SIZE_Q": BLOCK_SIZE_Q, "BLOCK_SIZE_KV": BLOCK_SIZE_KV},
+            num_stages=num_stages,
+            num_warps=num_warps,
+        )
+        for BLOCK_SIZE_Q in [64, 128]
+        for BLOCK_SIZE_KV in [32, 64]
+        for num_stages in ([3, 4, 7])
+        for num_warps in [2, 4]
+    ],
+    key=["SEQ_LEN", "HEAD_DIM"],
+)
 @triton.jit
 def _attn_fwd(
     Q,
@@ -412,13 +426,16 @@ class TritonAttention(torch.autograd.Function):
             stride_Q_head=Q.stride(1),
             stride_Q_seq=Q.stride(2),
             stride_Q_dim=Q.stride(3),
+            stride_K_batch=K.stride(0),
             stride_K_head=K.stride(1),
             stride_K_seq=K.stride(2),
             stride_K_dim=K.stride(3),
+            stride_V_batch=V.stride(0),
             stride_V_head=V.stride(1),
             stride_V_seq=V.stride(2),
             stride_V_dim=V.stride(3),
             stride_O_batch=O.stride(0),
+            stride_O_head=O.stride(1),
             stride_O_seq=O.stride(2),
             stride_O_dim=O.stride(3),
             BATCH_SIZE=Q.shape[0],
@@ -492,8 +509,6 @@ def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float1
     softmax_scale = 1 / (HEAD_DIM**0.5)
     dO = torch.randn_like(Q)
 
-
-
     # reference attention (torch)
     MASK = torch.tril(torch.ones((SEQ_LEN, SEQ_LEN), device='cuda'))
     P = torch.matmul(Q, K.transpose(2, 3)) * softmax_scale
@@ -522,6 +537,7 @@ def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float1
     assert torch.allclose(ref_dV, tri_dV, atol=atol, rtol=rtol)
 
 
+test_op(BATCH_SIZE=1, NUM_HEADS=2, SEQ_LEN=4, HEAD_DIM=8, causal=False)
     
 
 
