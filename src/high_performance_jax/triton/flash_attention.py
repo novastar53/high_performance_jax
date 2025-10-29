@@ -510,9 +510,9 @@ def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float1
     dO = torch.randn_like(Q)
 
     # reference attention (torch)
-    MASK = torch.tril(torch.ones((SEQ_LEN, SEQ_LEN), device='cuda'))
     P = torch.matmul(Q, K.transpose(2, 3)) * softmax_scale
     if causal:
+        MASK = torch.tril(torch.ones((SEQ_LEN, SEQ_LEN), device='cuda'))
         P[:, :, MASK == 0] = float("-inf")
     P = torch.softmax(P.float(), dim=-1).half()
     ref_O = torch.matmul(P, V)
@@ -524,7 +524,7 @@ def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float1
 
     # triton implementation
     tri_out = TritonAttention.apply(Q, K, V, causal, softmax_scale).half()
-    tri_out.backward()
+    tri_out.backward(dO)
     tri_dV, V.grad = V.grad.clone(), None
     tri_dK, K.grad = K.grad.clone(), None
     tri_dQ, Q.grad = Q.grad.clone(), None
@@ -534,6 +534,7 @@ def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float1
     atol = 1e-2
     assert torch.allclose(ref_O, tri_out, atol=atol, rtol=rtol)
     assert torch.allclose(ref_dK, tri_dK, atol=atol, rtol=rtol)
+    assert torch.allclose(ref_dQ, tri_dQ, atol=atol, rtol=rtol)
     assert torch.allclose(ref_dV, tri_dV, atol=atol, rtol=rtol)
 
 
