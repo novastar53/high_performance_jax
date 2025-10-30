@@ -13,7 +13,7 @@ def add_kernel(x_ptr,
     pid = tl.program_id(axis=0)
     block_start = pid * BLOCKSIZE
     offsets = block_start + tl.arange(0, BLOCKSIZE)
-    mask = tl.full_like(offsets, 1) # > n_elements
+    mask = tl.full(offsets.shape, 1, tl.int1) # > n_elements
 
     x = tl.load(x_ptr + offsets, mask=mask)
     y = tl.load(y_ptr + offsets, mask=mask)
