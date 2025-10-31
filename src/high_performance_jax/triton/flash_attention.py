@@ -287,7 +287,7 @@ def _attn_fwd(
         order=(0, 1)
     )
 
-    Q_block_ptr = tl.make_block_ptr( # Q[index_batch, index_head, block_index_q * BLOCK_SIZE_Q:, :]
+    O_block_ptr = tl.make_block_ptr( # Q[index_batch, index_head, block_index_q * BLOCK_SIZE_Q:, :]
         base=O + qvk_offset,
         shape=(SEQ_LEN, HEAD_DIM),
         strides=(stride_O_seq, stride_O_dim),
@@ -397,6 +397,7 @@ class TritonAttention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q, K, V, causal, softmax_scale, dtype=torch.float16):
         HEAD_DIM_Q, HEAD_DIM_K, HEAD_DIM_V  = Q.shape[-1], K.shape[-1], V.shape[-1]
+
         BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM = Q.shape
 
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
@@ -404,7 +405,10 @@ class TritonAttention(torch.autograd.Function):
         O = torch.empty_like(Q)
         stage = 3 if causal else 1
 
+        # Configure the Triton launch grid based on sequence blocks and per-head batches.
+        # Number of parallel programs: (BATCH_SIZE x NUM_HEADS x NUM_BLOCKS_Q)
         grid = lambda args: (
+            # How many blocks of Q we have.
             triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]), # Which group of queries are we going to work with? 
             BATCH_SIZE * NUM_HEADS, # Which head of which batch element are we going to work with?
             1,
