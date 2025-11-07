@@ -6,9 +6,10 @@ import triton.language as tl
 # Make a simple 2D tensor A in GPU memory (HBM): values 0..(N*M-1)
 N, M = 8, 8
 A = torch.arange(N * M, device='cuda', dtype=torch.float32).reshape(N, M)
+print(A.stride(0), A.stride(1))
 
 # Choose a block (tile) to load: size HxW starting at (row0, col0)
-BLOCK_H, BLOCK_W = 3, 4
+BLOCK_H, BLOCK_W = 4, 4
 row0, col0 = 2, 3
 
 # Output buffer (on GPU as well), will hold the loaded tile
@@ -51,8 +52,8 @@ def load_block_kernel(
     # Store to a contiguous output buffer so we can read it back easily
     out_ptrs = (
         out_ptr
-        + tl.arange(0, BLOCK_H)[:, None] * BLOCK_W
-        + tl.arange(0, BLOCK_W)[None, :]
+        + tl.arange(0, BLOCK_H)[:, None] * stride_row
+        + tl.arange(0, BLOCK_W)[None, :] * stride_col
     )
     tl.store(out_ptrs, tile)
 
