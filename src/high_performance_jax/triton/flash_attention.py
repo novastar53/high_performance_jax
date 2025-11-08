@@ -111,8 +111,11 @@ import torch
 import triton
 import triton.language as tl
 
-
+@triton.jit
 def _attn_fwd_inner(
+    O_block,
+    l_i,
+    m_i,
     Q_block,
     K_block_ptr,
     V_block_ptr,
@@ -184,6 +187,8 @@ def _attn_fwd_inner(
         # Move to the next block of K and V
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_SIZE_KV, 0)) # V[SEQ_LEN, HEAD_DIM]
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_SIZE_KV)) # # K[HEAD_DIM, SEQ_LEN]
+    
+    return O_block, l_i, m_i
 
 
 
@@ -328,6 +333,7 @@ def _attn_fwd(
             V_block_ptr,
             block_index_q,
             softmax_scale,
+            BLOCK_SIZE_Q,
             BLOCK_SIZE_KV,
             4 - STAGE,
             offs_q, 
@@ -357,7 +363,7 @@ def _attn_fwd(
 
     m_i += tl.math.log(l_i) # This is needed to compute the logsumexp for the backwards pass
 
-    O_block = O_block / l_i[i, None]
+    O_block = O_block / l_i[:, None]
     m_ptrs = M + index_batch_head * SEQ_LEN + offs_q
     tl.store(m_ptrs, m_i)
     tl.store(O_block_ptr, O_block.to(O.type.element_ty))
@@ -686,7 +692,7 @@ class TritonAttention(torch.autograd.Function):
         ctx.softmax_scale = softmax_scale
         ctx.HEAD_DIM = HEAD_DIM_K
         ctx.causal = causal
-        return 0
+        return O
     
     @staticmethod
     def backward(ctx, dO):
@@ -717,6 +723,8 @@ class TritonAttention(torch.autograd.Function):
         )
 
         grid = (SEQ_LEN // BLOCK_SIZE_MACRO, 1, BATCH_SIZE * NUM_HEADS)
+
+        stage = 3 if ctx.causal else 1
 
         # Fix KV and iterate through all the Q blocks
         _attn_bwd_dk_dv[grid](
@@ -822,6 +830,8 @@ def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float1
     tri_dK, K.grad = K.grad.clone(), None
     tri_dQ, Q.grad = Q.grad.clone(), None
 
+    print(tri_out.mean(), ref_O.mean())
+
     # compare
     rtol = 0.0
     atol = 1e-2
@@ -831,7 +841,7 @@ def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float1
     assert torch.allclose(ref_dV, tri_dV, atol=atol, rtol=rtol)
 
 
-test_op(BATCH_SIZE=1, NUM_HEADS=2, SEQ_LEN=4, HEAD_DIM=8, causal=False)
+test_op(BATCH_SIZE=1, NUM_HEADS=2, SEQ_LEN=4, HEAD_DIM=32, causal=False)
     
 
 
