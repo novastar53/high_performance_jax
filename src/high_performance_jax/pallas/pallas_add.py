@@ -23,7 +23,7 @@ print(out.shape, out.dtype, out, out.device)
 
 
 total_shape = (4096, 4096)
-block_shape = (512, 512)
+block_shape = (4096, 4096)
 
 
 def add_matrices_pipelined_kernel(x_ref, y_ref, o_ref):
@@ -52,7 +52,7 @@ np.testing.assert_array_equal(
 
 
 # Reduction (TPU)
-
+'''
 def correct_sum_kernel(x_ref, o_ref):
     @pl.when(pl.program_id(2) == 0)
     def _():
@@ -77,3 +77,4 @@ print(jnp.sum(x, axis=0))
 
 result = correct_sum(x)
 print(result)
+'''
