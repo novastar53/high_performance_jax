@@ -2,24 +2,18 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
+
 from jax.experimental import pallas as pl
 
-
-def matmul_kernel(x_sram_ref, y_sram_ref, z_sram_ref):
-    # Load x and y from SRAM into registers
-    x_regs = x_sram_ref[:, :]
-    y_regs = y_sram_ref[:, :]
-    # Execute a vectorized matmul
-    z_regs = x_regs @ y_regs
-    # Store the output values in registers back into SRAM
-    z_sram_ref[:, :] = z_regs
-
+def matmul_kernel(x_ref, y_ref, o_ref):
+    x_reg = x_ref[...]
+    y_reg = y_ref[...]
+    o_reg = x_reg @ y_reg
+    o_ref[...] = o_reg
 
 @partial(jax.jit, static_argnums=(0,))
-def matmul(G: int, x: jax.Array, y: jax.Array):
-    # pallas_call will first allocate scratch buffers for `x` and `y` in SRAM.
-    # It will then copy `x` and `y` from HBM into SRAM.
-    z = pl.pallas_call(
+def matmul(G, x, y):
+    o = pl.pallas_call(
         matmul_kernel,
         out_shape=jax.ShapeDtypeStruct((x.shape[0], y.shape[1]), x.dtype),
         grid=(G, G),
@@ -27,13 +21,9 @@ def matmul(G: int, x: jax.Array, y: jax.Array):
             pl.BlockSpec((x.shape[0] // G, x.shape[1]), lambda i, j: (i, 0)),
             pl.BlockSpec((y.shape[0], y.shape[1] // G), lambda i, j: (0, j))
         ],
-        out_specs=pl.BlockSpec(
-            (x.shape[0] // G, y.shape[1] // G), lambda i, j: (i, j)
-        )
+        out_specs=pl.BlockSpec((x.shape[0] // G, y.shape[1] // G), lambda i, j: (i, j))
     )(x, y)
-    # pallas_call will also copy the output from SRAM back into HBM.
-    return z
-
+    return o
 
 B = 4
 D = 512

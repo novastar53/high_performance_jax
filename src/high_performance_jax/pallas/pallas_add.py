@@ -23,7 +23,7 @@ print(out.shape, out.dtype, out, out.device)
 
 
 total_shape = (4096, 4096)
-block_shape = (4096, 4096)
+block_shape = (64, 64)
 
 
 def add_matrices_pipelined_kernel(x_ref, y_ref, o_ref):
