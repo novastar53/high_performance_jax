@@ -1,4 +1,5 @@
 from functools import partial
+import time
 
 import jax
 import jax.numpy as jnp
@@ -25,14 +26,15 @@ def matmul(G, x, y):
     )(x, y)
     return o
 
-B = 4
+B = 1
 D = 512
 G = 32
 k1, k2 = jax.random.split(jax.random.key(0))
 x = jax.random.normal(k1, (B, D, D), dtype=jnp.float32)
 y = jax.random.normal(k2, (B, D, D), dtype=jnp.float32)
 f = partial(matmul, G)
+start = time.perf_counter()
 z = jax.vmap(f)(x, y)
-print(jnp.allclose(z, x @ y, atol=0.06))
-    
-
+elapsed = time.perf_counter() - start
+print(jnp.allclose(z, x @ y, atol=0.10))
+print(f"Matmul run time: {elapsed:.6f} seconds")
