@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import jax.experimental.pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
-D = 128
+D = 256
 key = jax.random.key(0)
 logits = jax.random.normal(shape=(D, D), key=key)
 
@@ -22,7 +22,7 @@ probs_manual = s / l
 assert(jnp.allclose(probs_ref, probs_manual))
 
 # Pallas softmax
-G = 4 # Num groups
+G = 8 # Num groups
 
 def softmax_kernel(x_ref, o_ref):
     x_reg = x_ref[...]
@@ -43,4 +43,5 @@ def softmax(logits):
 
 
 probs_pl = softmax(logits)
-print(probs_pl)
+s = jnp.exp(logits)
+assert(jnp.allclose(probs_pl, s))
