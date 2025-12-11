@@ -1,21 +1,25 @@
+import time
 import functools
+
 import jax
 from jax import lax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
-BLOCK_M = 16
-BLOCK_N = 16
-BLOCK_K = 16
+BLOCK_M = 512
+BLOCK_N = 512
+BLOCK_K = 512
+
+INTERPRET_MODE = True # Set to False on GPU
 
 def matmul_kernel(a_ref, b_ref, c_ref, *, K: int):
     # a_ref: [BM, K]   block of rows of A
     # b_ref: [K, BN]   block of cols of B
     # c_ref: [BM, BN]  output tile
 
-    a_block = a_ref[...]
-    b_block = b_ref[...]
+    a_block = plgpu.load(a_ref, other=0.0)
+    b_block = plgpu.load(b_ref, other=0.0)
 
     acc = jnp.zeros((BLOCK_M, BLOCK_N), dtype=jnp.float32)
 
@@ -27,9 +31,10 @@ def matmul_kernel(a_ref, b_ref, c_ref, *, K: int):
 
     num_k_tiles = K // BLOCK_K
     acc = jax.lax.fori_loop(0, num_k_tiles, body, acc)
-    c_ref[...] = acc.astype(c_ref.dtype)
+    plgpu.store(c_ref, acc.astype(c_ref.dtype))
 
 
+@jax.jit
 def matmul(a: jax.Array, b: jax.Array) -> jax.Array:
     M, K = a.shape
     K2, N = b.shape
@@ -49,12 +54,40 @@ def matmul(a: jax.Array, b: jax.Array) -> jax.Array:
             pl.BlockSpec((K, BLOCK_N), lambda i, j: (0, j)),  # B
         ],
         out_specs=pl.BlockSpec((BLOCK_M, BLOCK_N), lambda i, j: (i, j)),  # C
-        interpret=True
+        interpret=INTERPRET_MODE
         #compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=2),
     )(a, b)
 
-# Example usage (on GPU):
-a = jax.random.normal(jax.random.key(0), (64, 64), dtype=jnp.float32)
-b = jax.random.normal(jax.random.key(1), (64, 64), dtype=jnp.float32)
-c = matmul(a, b)
-jnp.allclose(c, a @ b, atol=1e-3, rtol=1e-3)
+
+
+
+key = jax.random.key(0)
+M = N = K = 1024  # pick something big enough and divisible by BM/BN/BK
+
+a = jax.random.normal(key, (M, K), dtype=jnp.float32)
+b = jax.random.normal(key, (K, N), dtype=jnp.float32)
+
+# JIT both
+jax_mm_jit = jax.jit(lambda x, y: x @ y)
+
+# Warmup (compile + first run)
+_ = matmul(a, b).block_until_ready()
+_ = jax_mm_jit(a, b).block_until_ready()
+
+def bench(fn, *args, iters=10):
+    times = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        out = fn(*args)
+        out.block_until_ready()   # very important
+        t1 = time.perf_counter()
+        times.append(t1 - t0)
+    times.sort()
+    return times[len(times)//2]   # median
+
+t_pallas = bench(matmul, a, b)
+t_jax    = bench(jax_mm_jit, a, b)
+
+print(f"Pallas matmul: {t_pallas*1e3:.2f} ms")
+print(f"JAX   matmul: {t_jax*1e3:.2f} ms")
+print(f"Speedup (baseline / pallas): {t_jax / t_pallas:.2f}x")
