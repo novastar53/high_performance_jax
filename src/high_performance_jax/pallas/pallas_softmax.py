@@ -1,57 +1,100 @@
+import time
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 import jax.experimental.pallas as pl
-#from jax.experimental.pallas import triton as plgpu
-
-D = 8
-key = jax.random.key(0)
-logits = jax.random.normal(shape=(D, D), key=key)
+from jax.experimental.pallas import triton as plgpu
 
 
-# Basic softmax
-probs_ref = jax.nn.softmax(logits, axis=-1)
+INTERPRET_MODE = False # Set to False on GPU
 
 
 # Manual softmax (jax)
-max_rows = jnp.max(logits, axis=-1)
-s = jnp.exp(logits - max_rows[..., None])
-l = jnp.sum(s, axis=-1)
-l = l[..., None]
-probs_manual = s / l 
+def manual_softmax(logits):
+    max_rows = jnp.max(logits, axis=-1)
+    s = jnp.exp(logits - max_rows[..., None])
+    l = jnp.sum(s, axis=-1)
+    l = l[..., None]
+    return s / l 
 
-assert(jnp.allclose(probs_ref, probs_manual))
 
-# Pallas softmax
-G = 2 # Num groups
+def softmax_kernel(x_ref, o_ref, mo_ref, *, G: int):
 
-def softmax_kernel(x_ref, mi_ref, o_ref, mo_ref):
     x_reg = x_ref[...]
-    x_max_reg = jnp.max(x_reg, axis=-1)[..., None]
-    mo_reg = jnp.maximum(mi_ref[...], x_max_reg)
     o_reg = jnp.exp(x_reg)
+
+    mo_reg = jnp.zeros((BLK_SIZE,), dtype=jnp.float32)
+
+    def body(t, mo_reg):
+        idx = pl.dslice(t * BLK_SIZE, BLK_SIZE)
+        mo_tile = plgpu.load(x_ref.at[:, idx])
+        mo_tile_max = jnp.max(mo_tile, axis=-1)
+        mo_reg = jnp.maximum(mo_reg, mo_tile_max)
+        return mo_reg
+        
     o_ref[...] = o_reg
-    mi_ref[...] = mo_reg
+    mo_reg = jax.lax.fori_loop(0, G, body, mo_reg)
     mo_ref[...] = mo_reg
 
 
 @jax.jit
-def softmax(logits, m):
-    result = pl.pallas_call(
-        softmax_kernel,
-        out_shape=[jax.ShapeDtypeStruct(logits.shape, logits.dtype), jax.ShapeDtypeStruct(m.shape, m.dtype)],
-        grid=(G, G),
-        in_specs=[pl.BlockSpec((logits.shape[0] // G, logits.shape[1] // G), lambda i, j: (i, j)),
-                  pl.BlockSpec((m.shape[0] // G, 1), lambda i, j: (i, 0))],
-        out_specs=[pl.BlockSpec((logits.shape[0] // G, logits.shape[1] // G), lambda i, j: (i, j)),
-                   pl.BlockSpec((m.shape[0] // G, 1), lambda i, j: (i, 0))],
-        interpret=True
-    )(logits, m)
-    return result
+def softmax(logits):
+    G = pl.cdiv(D, BLK_SIZE)
+    o, m = pl.pallas_call(
+        partial(softmax_kernel, G=G),
+        out_shape=[jax.ShapeDtypeStruct(logits.shape, logits.dtype), 
+                   jax.ShapeDtypeStruct((logits.shape[0],), logits.dtype)],
+        grid=(G,1),
+        in_specs=[pl.BlockSpec((BLK_SIZE, logits.shape[1]), lambda i, j: (i, 0))],
+        out_specs=[pl.BlockSpec((BLK_SIZE, logits.shape[1]), lambda i, j: (i, 0)),
+                   pl.BlockSpec((BLK_SIZE,), lambda i, j: (i,))],
+        interpret=INTERPRET_MODE
+    )(logits)
+    return o, m
 
 
-m = jnp.ones((logits.shape[0], 1)) * float('inf') * (-1)
-probs_pl, m_pl = softmax(logits, m)
+
+
+D = 4096
+key = jax.random.key(0)
+logits = jax.random.normal(shape=(D, D), key=key)
+
+# Pallas softmax
+BLK_SIZE = 4 
+
+probs_pl, max_pl = softmax(logits)
 s = jnp.exp(logits)
-m_gt = jnp.max(logits, axis=-1)
+max_gt = jnp.max(logits, axis=-1)
 assert(jnp.allclose(probs_pl, s))
-assert(jnp.allclose(jnp.squeeze(m_pl),m_gt))
+assert(jnp.allclose(jnp.squeeze(max_pl),max_gt))
+
+# JIT compile
+softmax_jit = jax.jit(jax.nn.softmax)
+softmax_manual_jit = jax.jit(manual_softmax)
+softmax_pallas_jit = lambda x: softmax(x)[1]
+
+# Warmup (compile + first run)
+_ = softmax_jit(logits).block_until_ready()
+_ = softmax_manual_jit(logits).block_until_ready()
+_ = softmax_pallas_jit(logits).block_until_ready()
+
+def bench(fn, *args, iters=10):
+    times = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        out = fn(*args)
+        out.block_until_ready()   # very important
+        t1 = time.perf_counter()
+        times.append(t1 - t0)
+    times.sort()
+    return times[len(times)//2]   # median
+
+t_jax       = bench(softmax_jit, logits)
+t_manual    = bench(softmax_manual_jit, logits)
+t_pallas    = bench(softmax_pallas_jit, logits)
+
+print(f"Jax Softmax: {t_jax*1e3:.2f} ms")
+print(f"Manual Softmax: {t_manual*1e3:.2f} ms")
+print(f"Pallas Softmax: {t_pallas*1e3:.2f} ms")
+print(f"Speedup (jax / manual): {t_jax / t_manual:.2f}x")
