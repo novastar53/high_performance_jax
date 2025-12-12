@@ -9,6 +9,8 @@ from jax.experimental.pallas import triton as plgpu
 
 INTERPRET_MODE = False # Set to False on GPU
 
+# Pallas softmax
+BLK_SIZE = 32
 
 # Manual softmax (jax)
 def manual_softmax(logits):
@@ -60,8 +62,6 @@ D = 4096
 key = jax.random.key(0)
 logits = jax.random.normal(shape=(D, D), key=key)
 
-# Pallas softmax
-BLK_SIZE = 4 
 
 probs_pl, max_pl = softmax(logits)
 s = jnp.exp(logits)
