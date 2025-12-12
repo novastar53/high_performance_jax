@@ -7,7 +7,7 @@ import jax.experimental.pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
 
-INTERPRET_MODE = False # Set to False on GPU
+INTERPRET_MODE = True # Set to False on GPU
 
 # Pallas softmax
 BLK_SIZE = 32
@@ -23,19 +23,17 @@ def manual_softmax(logits):
 
 def softmax_kernel(x_ref, o_ref, mo_ref, *, G: int):
 
-    x_reg = x_ref[...]
-    o_reg = jnp.exp(x_reg)
-
     mo_reg = jnp.zeros((BLK_SIZE,), dtype=jnp.float32)
 
     def body(t, mo_reg):
         idx = pl.dslice(t * BLK_SIZE, BLK_SIZE)
-        mo_tile = plgpu.load(x_ref.at[:, idx])
-        mo_tile_max = jnp.max(mo_tile, axis=-1)
+        x_tile = plgpu.load(x_ref.at[:, idx])
+        x_exp = jnp.exp(x_tile)
+        plgpu.store(o_ref.at[:, idx], x_exp.astype(o_ref.dtype))
+        mo_tile_max = jnp.max(x_tile, axis=-1)
         mo_reg = jnp.maximum(mo_reg, mo_tile_max)
         return mo_reg
         
-    o_ref[...] = o_reg
     mo_reg = jax.lax.fori_loop(0, G, body, mo_reg)
     mo_ref[...] = mo_reg
 
