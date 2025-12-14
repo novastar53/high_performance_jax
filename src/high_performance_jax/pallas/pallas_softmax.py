@@ -21,21 +21,21 @@ def manual_softmax(logits):
     return s / l 
 
 
-def softmax_kernel(x_ref, o_ref, mo_ref, *, G: int):
+def softmax_kernel(x_ref, o_ref, max_ref, *, G: int):
 
-    mo_reg = jnp.zeros((BLK_SIZE,), dtype=jnp.float32)
+    max_reg = jnp.zeros((BLK_SIZE,), dtype=jnp.float32) 
 
-    def body(t, mo_reg):
+    def body(t, max_reg):
         idx = pl.dslice(t * BLK_SIZE, BLK_SIZE)
         x_tile = plgpu.load(x_ref.at[:, idx])
         x_exp = jnp.exp(x_tile)
+        max_tile = jnp.max(x_exp, axis=-1)
+        max_reg = jnp.maximum(max_reg, max_tile)
         plgpu.store(o_ref.at[:, idx], x_exp.astype(o_ref.dtype))
-        mo_tile_max = jnp.max(x_tile, axis=-1)
-        mo_reg = jnp.maximum(mo_reg, mo_tile_max)
-        return mo_reg
+        return max_reg
         
-    mo_reg = jax.lax.fori_loop(0, G, body, mo_reg)
-    mo_ref[...] = mo_reg
+    max_reg = jax.lax.fori_loop(0, G, body, max_reg)
+    max_ref[...] = max_reg
 
 
 @jax.jit
@@ -63,7 +63,9 @@ logits = jax.random.normal(shape=(D, D), key=key)
 
 probs_pl, max_pl = softmax(logits)
 s = jnp.exp(logits)
-max_gt = jnp.max(logits, axis=-1)
+max_gt = jnp.max(s, axis=-1)
+print(max_pl)
+print(max_gt)
 assert(jnp.allclose(probs_pl, s))
 assert(jnp.allclose(jnp.squeeze(max_pl),max_gt))
 
