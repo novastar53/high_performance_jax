@@ -10,7 +10,7 @@ from jax.experimental.pallas import triton as plgpu
 INTERPRET_MODE = True # Set to False on GPU
 
 # Pallas softmax
-BLK_SIZE = 32
+BLK_SIZE = 4096*4
 
 # Manual softmax (jax)
 def manual_softmax(logits):
@@ -19,6 +19,15 @@ def manual_softmax(logits):
     l = jnp.sum(s, axis=-1)
     l = l[..., None]
     return s / l 
+
+
+def basic_softmax_kernel(x_ref, o_ref, max_ref, *, G: int):
+
+    x_tile = x_ref[...]
+    max_rows = jnp.max(x_tile, axis=-1)
+    x_exp = jnp.exp(x_tile)
+    o_ref[...] = x_exp
+    max_ref[...] = max_rows
 
 
 def softmax_kernel(x_ref, o_ref, max_ref, *, G: int):
@@ -42,7 +51,7 @@ def softmax_kernel(x_ref, o_ref, max_ref, *, G: int):
 def softmax(logits):
     G = pl.cdiv(D, BLK_SIZE)
     o, m = pl.pallas_call(
-        partial(softmax_kernel, G=G),
+        partial(basic_softmax_kernel, G=G),
         out_shape=[jax.ShapeDtypeStruct(logits.shape, logits.dtype), 
                    jax.ShapeDtypeStruct((logits.shape[0],), logits.dtype)],
         grid=(G,1),
@@ -56,14 +65,14 @@ def softmax(logits):
 
 
 
-D = 4096
+D = 4096*4
 key = jax.random.key(0)
 logits = jax.random.normal(shape=(D, D), key=key)
 
 
 probs_pl, max_pl = softmax(logits)
+max_gt = jnp.max(logits, axis=-1)
 s = jnp.exp(logits)
-max_gt = jnp.max(s, axis=-1)
 print(max_pl)
 print(max_gt)
 assert(jnp.allclose(probs_pl, s))
