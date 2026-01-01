@@ -10,6 +10,8 @@ from jax.experimental.pallas import triton as plgpu
 BLOCK_M = 128
 BLOCK_N = 128
 BLOCK_K = 32
+NUM_WARPS = 8
+NUM_STAGES = 4
 
 INTERPRET_MODE = False # Set to False on GPU
 
@@ -22,8 +24,8 @@ def matmul_kernel(a_ref, b_ref, c_ref, *, K: int, num_k_tiles: int):
 
     def body(t, acc):
         k_idx = pl.dslice(t * BLOCK_K, BLOCK_K)
-        a_tile = plgpu.load(a_ref.at[:, k_idx]) #.astype(jnp.bfloat16)
-        b_tile = plgpu.load(b_ref.at[k_idx, :]) #.astype(jnp.bfloat16)
+        a_tile = plgpu.load(a_ref.at[:, k_idx])
+        b_tile = plgpu.load(b_ref.at[k_idx, :])
         return acc + pl.dot(a_tile, b_tile).astype(jnp.float32)
 
     acc = jax.lax.fori_loop(0, num_k_tiles, body, acc)
@@ -52,7 +54,7 @@ def matmul(a: jax.Array, b: jax.Array) -> jax.Array:
         ],
         out_specs=pl.BlockSpec((BLOCK_M, BLOCK_N), lambda i, j: (i, j)),  # C
         interpret=INTERPRET_MODE,
-        #compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=2),
+        compiler_params=plgpu.CompilerParams(num_warps=NUM_WARPS, num_stages=NUM_STAGES),
     )(a, b)
 
 
