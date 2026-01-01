@@ -27,14 +27,34 @@ def matmul(G, x, y):
     return o
 
 B = 1
-D = 512
-G = 32
+D = 256
+G = 16
 k1, k2 = jax.random.split(jax.random.key(0))
 x = jax.random.normal(k1, (B, D, D), dtype=jnp.float32)
 y = jax.random.normal(k2, (B, D, D), dtype=jnp.float32)
 f = partial(matmul, G)
-start = time.perf_counter()
-z = jax.vmap(f)(x, y)
-elapsed = time.perf_counter() - start
-print(jnp.allclose(z, x @ y, atol=0.10))
-print(f"Matmul run time: {elapsed:.6f} seconds")
+#z = jax.vmap(f)(x, y)
+
+matmul_jit = jax.jit(lambda x, y: x @ y)
+
+# Warmup (compile + first run)
+_ = matmul_jit(x, y).block_until_ready()
+_ = jax.vmap(f)(x, y).block_until_ready()
+
+def bench(fn, *args, iters=10):
+    times = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        out = fn(*args)
+        out.block_until_ready()   # very important
+        t1 = time.perf_counter()
+        times.append(t1 - t0)
+    times.sort()
+    return times[len(times)//2]   # median
+
+t_jax       = bench(matmul_jit, x, y)
+t_pallas    = bench(jax.vmap(f), x, y)
+
+print(f"Jax Matmul: {t_jax*1e3:.2f} ms")
+print(f"Pallas Matmul: {t_pallas*1e3:.2f} ms")
+print(f"Speedup (jax / pallas): {t_jax / t_pallas:.2f}x")
