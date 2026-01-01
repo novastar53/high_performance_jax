@@ -132,14 +132,19 @@ if __name__ == "__main__":
     a = jax.random.normal(key, (M, K), dtype=jnp.bfloat16)
     b = jax.random.normal(key, (K, N), dtype=jnp.bfloat16)
 
-    # JIT both
+    # Autotune once, then fix the chosen config for profiling.
+    best_config = _autotune_config(a, b)
+    print(f"Chosen config: {best_config}")
+    tuned_mm = _COMPILED_CACHE[tuple(sorted(best_config.items()))]
+
+    # JIT baseline
     jax_mm_jit = jax.jit(lambda x, y: x @ y)
 
     # Warmup (compile + first run)
-    _ = matmul(a, b).block_until_ready()
+    _ = tuned_mm(a, b).block_until_ready()
     _ = jax_mm_jit(a, b).block_until_ready()
 
-    t_pallas = _bench(matmul, a, b)
+    t_pallas = _bench(tuned_mm, a, b)
     t_jax    = _bench(jax_mm_jit, a, b)
 
     print(f"Pallas matmul: {t_pallas*1e3:.2f} ms")
