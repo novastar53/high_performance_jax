@@ -1,3 +1,4 @@
+import math
 import time
 import functools
 
@@ -7,13 +8,13 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
-BLOCK_M = 128
-BLOCK_N = 128
+BLOCK_M = 64
+BLOCK_N = 64
 BLOCK_K = 32
 NUM_WARPS = 8
 NUM_STAGES = 4
 
-INTERPRET_MODE = True # Set to False on GPU
+INTERPRET_MODE = False # Set to False on GPU
 
 def matmul_kernel(a_ref, b_ref, c_ref, *, K: int, num_k_tiles: int):
 
@@ -70,7 +71,7 @@ jax_mm_jit = jax.jit(lambda x, y: x @ y)
 _ = matmul(a, b).block_until_ready()
 _ = jax_mm_jit(a, b).block_until_ready()
 
-def bench(fn, *args, iters=10):
+def bench(fn, *args, iters=100):
     times = []
     for _ in range(iters):
         t0 = time.perf_counter()
@@ -78,8 +79,7 @@ def bench(fn, *args, iters=10):
         out.block_until_ready()   # very important
         t1 = time.perf_counter()
         times.append(t1 - t0)
-    times.sort()
-    return times[len(times)//2]   # median
+    return sum(times) / len(times)
 
 t_pallas = bench(matmul, a, b)
 t_jax    = bench(jax_mm_jit, a, b)
