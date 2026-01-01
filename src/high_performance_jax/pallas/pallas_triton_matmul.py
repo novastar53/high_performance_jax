@@ -18,6 +18,7 @@ _AUTOTUNE_CONFIGS = [
 ]
 
 _AUTOTUNE_CACHE = {}
+_COMPILED_CACHE = {}
 
 
 def _matmul_kernel_factory(block_m: int, block_n: int, block_k: int):
@@ -68,10 +69,14 @@ def _matmul_with_config(a: jax.Array, b: jax.Array, *, config: dict) -> jax.Arra
     )(a, b)
 
 
-@jax.jit
 def matmul(a: jax.Array, b: jax.Array) -> jax.Array:
     config = _autotune_config(a, b)
-    return _matmul_with_config(a, b, config=config)
+    key = (tuple(sorted(config.items())))
+    fn = _COMPILED_CACHE.get(key)
+    if fn is None:
+        fn = jax.jit(lambda x, y, cfg=config: _matmul_with_config(x, y, config=cfg))
+        _COMPILED_CACHE[key] = fn
+    return fn(a, b)
 
 
 def _autotune_config(a: jax.Array, b: jax.Array) -> dict:
@@ -92,7 +97,11 @@ def _autotune_config(a: jax.Array, b: jax.Array) -> dict:
             continue
         if M % block_m or N % block_n or K % block_k:
             continue
-        fn = jax.jit(lambda x, y, cfg=config: _matmul_with_config(x, y, config=cfg))
+        key = (tuple(sorted(config.items())))
+        fn = _COMPILED_CACHE.get(key)
+        if fn is None:
+            fn = jax.jit(lambda x, y, cfg=config: _matmul_with_config(x, y, config=cfg))
+            _COMPILED_CACHE[key] = fn
         _ = fn(a, b).block_until_ready()
         t = _bench(fn, a, b, iters=5)
         if t < best_time:
