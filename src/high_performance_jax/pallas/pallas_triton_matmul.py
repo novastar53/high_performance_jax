@@ -75,7 +75,7 @@ def matmul(a: jax.Array, b: jax.Array) -> jax.Array:
 
 
 def _autotune_config(a: jax.Array, b: jax.Array) -> dict:
-    key = (a.shape, b.shape, a.dtype, b.dtype, a.device())
+    key = (a.shape, b.shape, a.dtype, b.dtype)
     cached = _AUTOTUNE_CACHE.get(key)
     if cached is not None:
         return cached
