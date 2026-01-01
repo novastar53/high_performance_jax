@@ -11,12 +11,9 @@ BLOCK_M = 128
 BLOCK_N = 128
 BLOCK_K = 32
 
-INTERPRET_MODE = False # Set to False on GPU
+INTERPRET_MODE = True # Set to False on GPU
 
 def matmul_kernel(a_ref, b_ref, c_ref, *, K: int, num_k_tiles: int):
-    # a_ref: [BM, K]   block of rows of A
-    # b_ref: [K, BN]   block of cols of B
-    # c_ref: [BM, BN]  output tile
 
     acc = jnp.zeros((BLOCK_M, BLOCK_N), dtype=jnp.float32)
 
@@ -37,8 +34,8 @@ def matmul(a: jax.Array, b: jax.Array) -> jax.Array:
     assert K == K2
     assert M % BLOCK_M == 0 and N % BLOCK_N == 0 and K % BLOCK_K == 0
 
-    grid = (M // BLOCK_M, N // BLOCK_N)
-    num_k_tiles = K // BLOCK_K
+    grid = (pl.cdiv(M, BLOCK_M), pl.cdiv(N, BLOCK_N))
+    num_k_tiles = pl.cdiv(K, BLOCK_K)
     out_shape = jax.ShapeDtypeStruct((M, N), a.dtype)
 
     return pl.pallas_call(
@@ -59,7 +56,7 @@ def matmul(a: jax.Array, b: jax.Array) -> jax.Array:
 
 
 key = jax.random.key(0)
-M = N = K = 4096  # pick something big enough and divisible by BM/BN/BK
+M = N = K = 1024  # pick something big enough and divisible by BM/BN/BK
 
 a = jax.random.normal(key, (M, K), dtype=jnp.bfloat16)
 b = jax.random.normal(key, (K, N), dtype=jnp.bfloat16)
