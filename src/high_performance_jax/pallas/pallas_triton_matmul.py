@@ -9,12 +9,12 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
 INTERPRET_MODE = False # Set to False on GPU
+DTYPE = jnp.float32
 
 _AUTOTUNE_CONFIGS = [
     {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "num_warps": 4, "num_stages": 2},
     {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "num_warps": 8, "num_stages": 3},
     {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32, "num_warps": 4, "num_stages": 2},
-    {"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 32, "num_warps": 8, "num_stages": 4},
 ]
 
 _AUTOTUNE_CACHE = {}
@@ -129,8 +129,8 @@ if __name__ == "__main__":
     key = jax.random.key(0)
     M = N = K = 1024  # pick something big enough and divisible by BM/BN/BK
 
-    a = jax.random.normal(key, (M, K), dtype=jnp.bfloat16)
-    b = jax.random.normal(key, (K, N), dtype=jnp.bfloat16)
+    a = jax.random.normal(key, (M, K), dtype=DTYPE)
+    b = jax.random.normal(key, (K, N), dtype=DTYPE)
 
     # Autotune once, then fix the chosen config for profiling.
     best_config = _autotune_config(a, b)
