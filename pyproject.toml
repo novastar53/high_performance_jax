@@ -17,13 +17,13 @@ dependencies = [
     "tqdm>=4.67.1",
     "lax>=1.0.0",
     "deepkit>=1.0.9",
-    "nvidia-cusparse>=12.7.2.19",
 ]
 
 [project.optional-dependencies]
 gpu = [
     "jax[cuda12]==0.8.1",
     "triton>=3.3.0 ; sys_platform == 'linux'",
+    "nvidia-cusparse>=12.7.2.19",
 ]
 tpu = [
     "libtpu",
