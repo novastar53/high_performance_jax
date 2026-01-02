@@ -7,10 +7,10 @@ import jax.experimental.pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
 
-INTERPRET_MODE = True # Set to False on GPU
+INTERPRET_MODE = False # Set to False on GPU
 
 # Pallas softmax
-BLK_SIZE = 128
+BLK_SIZE = 32
 
 # Manual softmax (jax)
 def manual_softmax(logits):
