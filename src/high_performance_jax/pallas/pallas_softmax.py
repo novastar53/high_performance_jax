@@ -7,10 +7,10 @@ import jax.experimental.pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
 
-INTERPRET_MODE = False # Set to False on GPU
+INTERPRET_MODE = True # Set to False on GPU
 
 # Pallas softmax
-BLK_SIZE = 32
+BLK_SIZE = 128
 
 # Manual softmax (jax)
 def manual_softmax(logits):
@@ -22,6 +22,7 @@ def manual_softmax(logits):
 
 # Online softmax
 def online_softmax(logits):
+    out = jnp.zeros_like(logits)
     m = jnp.full((logits.shape[0],), -jnp.inf)
     l = jnp.zeros((logits.shape[0],))
     for i in range(0, logits.shape[0], BLK_SIZE):
@@ -36,17 +37,19 @@ def online_softmax(logits):
                 jnp.exp(block - new_max[:, None]), axis=-1
             )
             l = l.at[i:i+BLK_SIZE].set(l_block)
+        out_block = jnp.exp(logits[i:i+BLK_SIZE, :] - m[i:i+BLK_SIZE][:, None]) / l[i:i+BLK_SIZE][:, None]
+        out = out.at[i:i+BLK_SIZE, :].set(out_block)
     
-    return m, l
+    return out
 
 
-def softmax_kernel(x_ref, m_ref, l_ref, *, n_col_blocks, n_rows, n_cols):
+def softmax_kernel(x_ref, m_ref, l_ref, out_ref, *, n_col_blocks, n_rows, n_cols):
     max_reg = jnp.full((BLK_SIZE,), -jnp.inf, dtype=jnp.float32) 
     l_reg = jnp.zeros((BLK_SIZE,), dtype=jnp.float32) 
     row_ids = pl.program_id(0) * BLK_SIZE + jnp.arange(BLK_SIZE)
     row_mask = row_ids < n_rows
 
-    def body(t, args):
+    def stats_body(t, args):
         max_reg, l_reg = args
         idx = pl.dslice(t * BLK_SIZE, BLK_SIZE)
         col_ids = t * BLK_SIZE + jnp.arange(BLK_SIZE)
@@ -67,7 +70,24 @@ def softmax_kernel(x_ref, m_ref, l_ref, *, n_col_blocks, n_rows, n_cols):
         l_reg = jnp.where(row_mask, l_update, l_reg)
         return max_reg, l_reg
         
-    max_reg, l_reg = jax.lax.fori_loop(0, n_col_blocks, body, (max_reg, l_reg))
+    max_reg, l_reg = jax.lax.fori_loop(0, n_col_blocks, stats_body, (max_reg, l_reg))
+
+    def out_body(t, _):
+        idx = pl.dslice(t * BLK_SIZE, BLK_SIZE)
+        col_ids = t * BLK_SIZE + jnp.arange(BLK_SIZE)
+        cols_mask = col_ids < n_cols
+        mask = row_mask[:, None] & cols_mask[None, :]
+
+        x_tile = plgpu.load(
+            x_ref.at[:, idx],
+            mask=mask,
+            other=-jnp.inf,
+        ).astype(jnp.float32)
+        out_tile = jnp.exp(x_tile - max_reg[:, None]) / l_reg[:, None]
+        plgpu.store(out_ref.at[:, idx], out_tile.astype(jnp.float32), mask=mask)
+
+    _ = jax.lax.fori_loop(0, n_col_blocks, out_body, None)
+
     plgpu.store(m_ref, max_reg, mask=row_mask)
     plgpu.store(l_ref, l_reg, mask=row_mask)
 
@@ -76,39 +96,35 @@ def softmax_kernel(x_ref, m_ref, l_ref, *, n_col_blocks, n_rows, n_cols):
 def softmax(logits):
     n_row_blocks = pl.cdiv(logits.shape[0], BLK_SIZE)
     n_col_blocks = pl.cdiv(logits.shape[1], BLK_SIZE)
-    m, l = pl.pallas_call(
+    return pl.pallas_call(
         partial(softmax_kernel, n_col_blocks=n_col_blocks, n_rows=logits.shape[0], n_cols=logits.shape[1]),
         out_shape=[jax.ShapeDtypeStruct((logits.shape[0],), jnp.float32),
-                   jax.ShapeDtypeStruct((logits.shape[0],), jnp.float32)],
+                   jax.ShapeDtypeStruct((logits.shape[0],), jnp.float32),
+                   jax.ShapeDtypeStruct(logits.shape, jnp.float32)],
         grid=(n_row_blocks,),
         in_specs=[pl.BlockSpec((BLK_SIZE, logits.shape[1]), lambda i: (i, 0))],
         out_specs=[pl.BlockSpec((BLK_SIZE,), lambda i: (i,)),
-                   pl.BlockSpec((BLK_SIZE,), lambda i: (i,))],
+                   pl.BlockSpec((BLK_SIZE,), lambda i: (i,)),
+                   pl.BlockSpec((BLK_SIZE, logits.shape[1]), lambda i: (i, 0))],
         interpret=INTERPRET_MODE
     )(logits)
-    return m, l
 
 
-D = 4096 * 2
+D = 1024 
 key = jax.random.key(0)
 logits = jax.random.normal(shape=(D, D), key=key)
 
-
-m_online, l_online = online_softmax(logits)
-print(m_online)
-print(l_online)
-
-max_pl, l = softmax(logits)
-print(max_pl)
+out_manual = manual_softmax(logits)
+out_online = online_softmax(logits)
+max_pl, l, out_pl = softmax(logits)
 max_gt = jnp.max(logits, axis=-1)
-print(max_gt)
 l_gt = jnp.sum(jnp.exp(logits - max_gt[..., None]), axis=-1)
-print(l)
-print(l_gt)
+
+# Check correctness
+assert(jnp.allclose(jnp.squeeze(out_manual),out_online))
+assert(jnp.allclose(jnp.squeeze(out_manual),out_pl))
 assert(jnp.allclose(jnp.squeeze(l_gt),l))
-assert(jnp.allclose(jnp.squeeze(l_gt),l_online))
 assert(jnp.allclose(jnp.squeeze(max_pl),max_gt))
-assert(jnp.allclose(jnp.squeeze(m_online),max_gt))
 
 # JIT compile
 softmax_jit = jax.jit(jax.nn.softmax)
@@ -138,4 +154,4 @@ t_pallas    = bench(softmax_pallas_jit, logits)
 print(f"Jax Softmax: {t_jax*1e3:.2f} ms")
 print(f"Manual Softmax: {t_manual*1e3:.2f} ms")
 print(f"Pallas Softmax: {t_pallas*1e3:.2f} ms")
-print(f"Speedup (jax / manual): {t_jax / t_pallas:.2f}x")
+print(f"Speedup (jax / pallas): {t_jax / t_pallas:.2f}x")
