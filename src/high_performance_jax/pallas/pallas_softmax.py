@@ -7,10 +7,10 @@ import jax.experimental.pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
 
-INTERPRET_MODE = True # Set to False on GPU
+INTERPRET_MODE = False # Set to False on GPU
 
 # Pallas softmax
-BLK_SIZE = 1024
+BLK_SIZE = 32
 
 # Manual softmax (jax)
 def manual_softmax(logits):
@@ -89,7 +89,7 @@ def softmax(logits):
     return m, l
 
 
-D = 4096*4
+D = 4096 * 2
 key = jax.random.key(0)
 logits = jax.random.normal(shape=(D, D), key=key)
 
@@ -103,7 +103,7 @@ print(max_pl)
 max_gt = jnp.max(logits, axis=-1)
 print(max_gt)
 l_gt = jnp.sum(jnp.exp(logits - max_gt[..., None]), axis=-1)
-print(l.mean())
+print(l)
 print(l_gt)
 assert(jnp.allclose(jnp.squeeze(l_gt),l))
 assert(jnp.allclose(jnp.squeeze(l_gt),l_online))
