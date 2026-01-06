@@ -1,4 +1,3 @@
-import time
 from functools import partial
 
 import jax
@@ -7,7 +6,7 @@ import jax.experimental.pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
 
-INTERPRET_MODE = False # Set to False on GPU
+INTERPRET_MODE = True # Set to False on GPU
 
 # Pallas softmax
 BLOCK_M = 64
@@ -107,46 +106,3 @@ def softmax(logits):
             num_stages=NUM_STAGES,
         ),
     )(logits)
-
-
-D = 4096 * 2
-key = jax.random.key(0)
-logits = jax.random.normal(shape=(D, D), key=key)
-
-out_jax = jax.nn.softmax(logits)
-out_manual = manual_softmax(logits)
-out_online = online_softmax(logits)
-out_pl = softmax(logits)
-
-# Check correctness
-assert(jnp.allclose(jnp.squeeze(out_jax),out_online))
-assert(jnp.allclose(jnp.squeeze(out_jax),out_manual))
-assert(jnp.allclose(jnp.squeeze(out_jax),out_pl))
-
-# JIT compile
-softmax_jit = jax.jit(jax.nn.softmax)
-softmax_manual_jit = jax.jit(manual_softmax)
-
-# Warmup (compile + first run)
-_ = softmax_jit(logits).block_until_ready()
-_ = softmax_manual_jit(logits).block_until_ready()
-_ = softmax(logits).block_until_ready()
-
-def bench(fn, *args, iters=100):
-    times = []
-    for _ in range(iters):
-        t0 = time.perf_counter()
-        out = fn(*args)
-        out.block_until_ready()   # very important
-        t1 = time.perf_counter()
-        times.append(t1 - t0)
-    return sum(times)  / len(times)  # median
-
-t_jax       = bench(softmax_jit, logits)
-t_manual    = bench(softmax_manual_jit, logits)
-t_pallas    = bench(softmax, logits)
-
-print(f"Jax Softmax: {t_jax*1e3:.2f} ms")
-print(f"Manual Softmax: {t_manual*1e3:.2f} ms")
-print(f"Pallas Softmax: {t_pallas*1e3:.2f} ms")
-print(f"Speedup (jax / pallas): {t_jax / t_pallas:.2f}x")
