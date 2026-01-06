@@ -79,6 +79,17 @@ def matmul(a: jax.Array, b: jax.Array) -> jax.Array:
     return fn(a, b)
 
 
+def _bench(fn, *args, iters=100):
+    times = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        out = fn(*args)
+        out.block_until_ready()   # very important
+        t1 = time.perf_counter()
+        times.append(t1 - t0)
+    return sum(times) / len(times)
+
+
 def _autotune_config(a: jax.Array, b: jax.Array) -> dict:
     key = (a.shape, b.shape, a.dtype, b.dtype)
     cached = _AUTOTUNE_CACHE.get(key)
@@ -114,3 +125,29 @@ def _autotune_config(a: jax.Array, b: jax.Array) -> dict:
     _AUTOTUNE_CACHE[key] = best_config
     return best_config
 
+
+if __name__ == "__main__":
+    key = jax.random.key(0)
+    M = N = K = 1024  # pick something big enough and divisible by BM/BN/BK
+
+    a = jax.random.normal(key, (M, K), dtype=DTYPE)
+    b = jax.random.normal(key, (K, N), dtype=DTYPE)
+
+    # Autotune once, then fix the chosen config for profiling.
+    best_config = _autotune_config(a, b)
+    print(f"Chosen config: {best_config}")
+    tuned_mm = _COMPILED_CACHE[tuple(sorted(best_config.items()))]
+
+    # JIT baseline
+    jax_mm_jit = jax.jit(lambda x, y: x @ y)
+
+    # Warmup (compile + first run)
+    _ = tuned_mm(a, b).block_until_ready()
+    _ = jax_mm_jit(a, b).block_until_ready()
+
+    t_pallas = _bench(tuned_mm, a, b)
+    t_jax    = _bench(jax_mm_jit, a, b)
+
+    print(f"Pallas matmul: {t_pallas*1e3:.2f} ms")
+    print(f"JAX   matmul: {t_jax*1e3:.2f} ms")
+    print(f"Speedup (baseline / pallas): {t_jax / t_pallas:.2f}x")
