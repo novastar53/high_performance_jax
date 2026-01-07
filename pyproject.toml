@@ -17,6 +17,7 @@ dependencies = [
     "tqdm>=4.67.1",
     "lax>=1.0.0",
     "deepkit>=1.0.9",
+    "flax>=0.12.2",
 ]
 
 [project.optional-dependencies]
