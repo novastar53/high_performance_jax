@@ -4,7 +4,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 
-from high_performance_jax.pallas.pallas_matmul import matmul as pallas_matmul
+from high_performance_jax.pallas.pallas_matmul_naive import matmul as pallas_matmul
 from high_performance_jax.pallas.pallas_softmax import manual_softmax, online_softmax, softmax
 from high_performance_jax.pallas.pallas_triton_matmul import DTYPE as TRITON_DTYPE
 from high_performance_jax.pallas.pallas_triton_matmul import _AUTOTUNE_CACHE as TRITON_AUTOTUNE_CACHE
