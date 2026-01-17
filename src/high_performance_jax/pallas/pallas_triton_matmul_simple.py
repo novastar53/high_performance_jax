@@ -6,10 +6,10 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
-INTERPRET_MODE = True  # Set to True to run on CPU.
+INTERPRET_MODE = False  # Set to True to run on CPU.
 
 BLOCK_M = 128
-BLOCK_N = 128
+BLOCK_N = 32
 BLOCK_K = 32
 NUM_WARPS = 4
 NUM_STAGES = 2
@@ -27,7 +27,7 @@ def _matmul_kernel(a_ref, b_ref, c_ref, *, num_k_tiles: int):
     acc = jax.lax.fori_loop(0, num_k_tiles, body, acc)
     plgpu.store(c_ref, acc.astype(c_ref.dtype))
 
-
+@jax.jit
 def matmul(a: jax.Array, b: jax.Array) -> jax.Array:
     outer_dims = a.shape[:-2]
     a_flat = a.reshape(-1, a.shape[-2], a.shape[-1])
@@ -67,8 +67,7 @@ def _bench(fn, *args, iters=10):
         out.block_until_ready()
         t1 = time.perf_counter()
         times.append(t1 - t0)
-    times.sort()
-    return times[len(times) // 2]
+    return sum(times)/len(times)
 
 
 if __name__ == "__main__":
