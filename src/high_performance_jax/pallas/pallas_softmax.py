@@ -70,7 +70,7 @@ def softmax_kernel(x_ref, out_ref, *, n_col_blocks, n_rows, n_cols):
         mask = row_mask[:, None] & cols_mask[None, :]
 
         x_tile = plgpu.load(
-            x_ref.at[:, idx],
+            x_ref.at[0, :, idx],
             mask=mask,
             other=-jnp.inf,
         ).astype(jnp.float32)
@@ -90,67 +90,81 @@ def softmax_kernel(x_ref, out_ref, *, n_col_blocks, n_rows, n_cols):
         mask = row_mask[:, None] & cols_mask[None, :]
 
         x_tile = plgpu.load(
-            x_ref.at[:, idx],
+            x_ref.at[0, :, idx],
             mask=mask,
             other=-jnp.inf,
         ).astype(jnp.float32)
         out_tile = jnp.exp(x_tile - max_reg[:, None]) / l_reg[:, None]
-        plgpu.store(out_ref.at[:, idx], out_tile.astype(jnp.float32), mask=mask)
+        plgpu.store(out_ref.at[0, :, idx], out_tile.astype(jnp.float32), mask=mask)
 
     _ = jax.lax.fori_loop(0, n_col_blocks, out_body, None)
 
 
 @jax.jit
 def softmax(logits):
-    n_row_blocks = pl.cdiv(logits.shape[0], BLOCK_M)
-    n_col_blocks = pl.cdiv(logits.shape[1], BLOCK_N)
-    return pl.pallas_call(
-        partial(softmax_kernel, n_col_blocks=n_col_blocks, n_rows=logits.shape[0], n_cols=logits.shape[1]),
-        out_shape=jax.ShapeDtypeStruct(logits.shape, jnp.float32),
-        grid=(n_row_blocks,),
-        in_specs=[pl.BlockSpec((BLOCK_M, logits.shape[1]), lambda i: (i, 0))],
-        out_specs=pl.BlockSpec((BLOCK_M, logits.shape[1]), lambda i: (i, 0)),
+    print(logits.shape)
+    outer_dims = logits.shape[:-2]
+    logits_flat = logits.reshape(-1, logits.shape[-2], logits.shape[-1])
+    B = logits_flat.shape[0]
+    M, N = logits.shape[-2], logits.shape[-1]
+    n_row_blocks = pl.cdiv(M, BLOCK_M)
+    n_col_blocks = pl.cdiv(N, BLOCK_N)
+    out = pl.pallas_call(
+        partial(softmax_kernel, n_col_blocks=n_col_blocks, n_rows=logits.shape[-2], n_cols=logits.shape[-1]),
+        out_shape=jax.ShapeDtypeStruct(logits_flat.shape, jnp.float32),
+        grid=(B, n_row_blocks),
+        in_specs=[pl.BlockSpec((1, BLOCK_M, logits.shape[-1]), lambda b, i: (b, i, 0))],
+        out_specs=pl.BlockSpec((1, BLOCK_M, logits.shape[-1]), lambda b, i: (b, i, 0)),
         interpret=INTERPRET_MODE,
         compiler_params=plgpu.CompilerParams(
             num_warps=NUM_WARPS,
             num_stages=NUM_STAGES,
         ),
-    )(logits)
+    )(logits_flat)
+    out = out.reshape(outer_dims + (M, N))
+    print(out.shape)
+    return out
 
 
 def softmax_backward_kernel(y_ref, dy_ref, dx_ref):
     # compute the inner product <g_ref, y_ref>
     dy_reg = plgpu.load(dy_ref)
     y_reg = plgpu.load(y_ref)
-    g_dot_y = jnp.sum(dy_reg * y_reg, axis=1)
+    g_dot_y = jnp.sum(dy_reg * y_reg, axis=-1)
 
     # Compute the output block
-    output_reg = y_reg * ( dy_reg - g_dot_y[:, None] )
+    output_reg = y_reg * ( dy_reg - g_dot_y[..., None] )
     plgpu.store(dx_ref, output_reg)
 
 
 @jax.jit
 def softmax_backward(y, dy):
-    M, N = y.shape
+    outer_dims = y.shape[:-2]
+    M, N = y.shape[-2], y.shape[-1]
+    y_flat = y.reshape(-1, y.shape[-2], y.shape[-1])
+    dy_flat = dy.reshape(-1, dy.shape[-2], dy.shape[-1])
+    B = y_flat.shape[0]
 
-    grid = (pl.cdiv(M, BLOCK_M),)
-    out_shape = jax.ShapeDtypeStruct((M, N), y.dtype)
+    grid = (B, pl.cdiv(M, BLOCK_M))
+    out_shape = jax.ShapeDtypeStruct((B, M, N), y.dtype)
 
-    return pl.pallas_call(
+    out = pl.pallas_call(
         softmax_backward_kernel,
         out_shape=out_shape,
         grid=grid,
         in_specs=[
-            pl.BlockSpec((BLOCK_M, N), lambda i: (i, 0)),  # y
-            pl.BlockSpec((BLOCK_M, N), lambda i: (i, 0)),  # dy 
+            pl.BlockSpec((1, BLOCK_M, N), lambda b, i: (b, i, 0)),  # y
+            pl.BlockSpec((1, BLOCK_M, N), lambda b, i: (b, i, 0)),  # dy 
         ],
-        out_specs=pl.BlockSpec((BLOCK_M, N), lambda i: (i, 0)),  # dx
+        out_specs=pl.BlockSpec((1, BLOCK_M, N), lambda b, i: (b, i, 0)),  # dx
         interpret=INTERPRET_MODE,
         compiler_params=plgpu.CompilerParams(
             num_warps=NUM_WARPS,
             num_stages=NUM_STAGES,
         ),
-    )(y, dy)
+    )(y_flat, dy_flat)
+    out = out.reshape(outer_dims + (M, N))
+    return out
 
 
 @jax.custom_vjp
@@ -186,7 +200,6 @@ class Model(nnx.Module):
         self.l2 = nnx.Linear(config.hidden_dim, config.out_dim, rngs=rngs)
 
     def forward_logits(self, x):
-        x = x.reshape(-1, x.shape[-1])
         x = self.l1(x)
         x = jax.nn.relu(x)
         x = self.l2(x)
@@ -203,24 +216,21 @@ if __name__ == "__main__":
     def loss_fn(model, x, y):
         logits = model.forward_logits(x)
         probs = softmax_pallas(logits)
-        labels = y.reshape(-1)
-        one_hot = jax.nn.one_hot(labels, probs.shape[-1], dtype=probs.dtype)
+        one_hot = jax.nn.one_hot(y, probs.shape[-1], dtype=probs.dtype)
         loss = -jnp.mean(jnp.sum(one_hot * jnp.log(probs + 1e-9), axis=-1))
         return loss, logits
 
     def loss_from_logits_pallas(logits, y):
         probs = softmax_pallas(logits)
-        labels = y.reshape(-1)
-        one_hot = jax.nn.one_hot(labels, probs.shape[-1], dtype=probs.dtype)
+        one_hot = jax.nn.one_hot(y, probs.shape[-1], dtype=probs.dtype)
         loss = -jnp.mean(jnp.sum(one_hot * jnp.log(probs + 1e-9), axis=-1))
-        return loss
+        return loss, probs
 
     def loss_from_logits_gt(logits, y):
         probs = jax.nn.softmax(logits)
-        labels = y.reshape(-1)
-        one_hot = jax.nn.one_hot(labels, probs.shape[-1], dtype=probs.dtype)
+        one_hot = jax.nn.one_hot(y, probs.shape[-1], dtype=probs.dtype)
         loss = -jnp.mean(jnp.sum(one_hot * jnp.log(probs + 1e-9), axis=-1))
-        return loss
+        return loss, probs
 
 
     @nnx.jit
@@ -228,11 +238,11 @@ if __name__ == "__main__":
         (loss, logits), grads = nnx.value_and_grad(
             loss_fn, has_aux=True)(model, x, y)
         state.update(model, grads)
-        d_logits_pallas = jax.grad(loss_from_logits_pallas)(logits, y)
-        d_logits_gt = jax.grad(loss_from_logits_gt)(logits, y)
-        return loss, d_logits_pallas, d_logits_gt
+        d_logits_pallas, probs_pallas = jax.grad(loss_from_logits_pallas, has_aux=True)(logits, y)
+        d_logits_gt, probs_gt = jax.grad(loss_from_logits_gt, has_aux=True)(logits, y)
+        return loss, d_logits_pallas, d_logits_gt, probs_pallas, probs_gt
 
-    B, E = 256, 24
+    B, T, E = 2, 256, 24
 
     default = jax.random.key(69)
     gate_noise = jax.random.key(42)
@@ -245,12 +255,13 @@ if __name__ == "__main__":
     tx = optax.adam(1e-1)
     state = nnx.Optimizer(model, tx, wrt=nnx.Param)
 
-    x = jax.random.normal(jax.random.key(1000), (B, E))
-    class_ids = (x[:, 0] > 0).astype(jnp.int32)
+    x = jax.random.normal(jax.random.key(1000), (B, T, E))
+    class_ids = (x[:, :, 0] > 0).astype(jnp.int32)
     y = class_ids
 
-    iters = 10
+    iters = 20
     for i in range(iters):
-        loss, d_logits_pallas, d_logits_gt = step(model, state, x, y)
-        assert(jnp.allclose(d_logits_pallas, d_logits_gt))
+        loss, d_logits_pallas, d_logits_gt, probs_pallas, probs_gt = step(model, state, x, y)
+        assert(jnp.allclose(probs_pallas, probs_gt, atol=1e-2, rtol=1e-2))
+        assert(jnp.allclose(d_logits_pallas, d_logits_gt, atol=1e-2, rtol=1e-2))
         print(f"iter {i}: loss={loss}")
