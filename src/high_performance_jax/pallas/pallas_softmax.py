@@ -206,7 +206,7 @@ if __name__ == "__main__":
         labels = y.reshape(-1)
         one_hot = jax.nn.one_hot(labels, probs.shape[-1], dtype=probs.dtype)
         loss = -jnp.mean(jnp.sum(one_hot * jnp.log(probs + 1e-9), axis=-1))
-        return loss, (probs, logits)
+        return loss, logits
 
     def loss_from_logits_pallas(logits, y):
         probs = softmax_pallas(logits)
@@ -224,10 +224,10 @@ if __name__ == "__main__":
 
 
     @nnx.jit
-    def step(state, x, y):
-        (loss, (y_pred, logits)), grads = nnx.value_and_grad(
-            loss_fn, has_aux=True)(state.model, x, y)
-        state.update(grads)
+    def step(model, state, x, y):
+        (loss, logits), grads = nnx.value_and_grad(
+            loss_fn, has_aux=True)(model, x, y)
+        state.update(model, grads)
         d_logits_pallas = jax.grad(loss_from_logits_pallas)(logits, y)
         d_logits_gt = jax.grad(loss_from_logits_gt)(logits, y)
         return loss, d_logits_pallas, d_logits_gt
@@ -243,7 +243,7 @@ if __name__ == "__main__":
     model = Model(config, rngs)
     model.train(add_noise=False)
     tx = optax.adam(1e-1)
-    state = nnx.Optimizer(model, tx)
+    state = nnx.Optimizer(model, tx, wrt=nnx.Param)
 
     x = jax.random.normal(jax.random.key(1000), (B, E))
     class_ids = (x[:, 0] > 0).astype(jnp.int32)
@@ -251,8 +251,6 @@ if __name__ == "__main__":
 
     iters = 10
     for i in range(iters):
-        loss, d_logits_pallas, d_logits_gt = step(state, x, y)
-        #print(d_logits_pallas)
-        #print(d_logits_gt)
+        loss, d_logits_pallas, d_logits_gt = step(model, state, x, y)
         assert(jnp.allclose(d_logits_pallas, d_logits_gt))
         print(f"iter {i}: loss={loss}")
