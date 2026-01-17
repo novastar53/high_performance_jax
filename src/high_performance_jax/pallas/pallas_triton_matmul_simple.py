@@ -1,3 +1,12 @@
+"""Simple Pallas/Triton matmul implementation.
+
+Performance Note:
+    This implementation runs at ~50% of JAX's default matmul (cuBLAS) performance.
+    The B matrix uses (N, K) layout with trans_b=True in pl.dot. Switching B to
+    (K, N) layout (and removing trans_b) yields performance comparable to cuBLAS,
+    suggesting the transposed dot path in Pallas/Triton may generate less efficient
+    code. Tuning BLOCK_M, BLOCK_N, BLOCK_K, NUM_WARPS, and NUM_STAGES may also help.
+"""
 import functools
 import time
 
@@ -73,8 +82,8 @@ def _bench(fn, *args, iters=10):
 
 if __name__ == "__main__":
     key = jax.random.key(0)
-    B = 2
-    T = 2
+    B = 1
+    T = 1
     M = N = K = 1024  # pick something big enough and divisible by BM/BN/BK
 
     a = jax.random.normal(key, (B, T, M, K), dtype=jnp.bfloat16)
