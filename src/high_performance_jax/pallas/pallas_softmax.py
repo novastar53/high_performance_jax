@@ -242,7 +242,7 @@ if __name__ == "__main__":
         d_logits_gt, probs_gt = jax.grad(loss_from_logits_gt, has_aux=True)(logits, y)
         return loss, d_logits_pallas, d_logits_gt, probs_pallas, probs_gt
 
-    B, T, E = 2, 256, 24
+    D, B, T, E = 2, 2, 256, 24
 
     default = jax.random.key(69)
     gate_noise = jax.random.key(42)
@@ -255,8 +255,8 @@ if __name__ == "__main__":
     tx = optax.adam(1e-1)
     state = nnx.Optimizer(model, tx, wrt=nnx.Param)
 
-    x = jax.random.normal(jax.random.key(1000), (B, T, E))
-    class_ids = (x[:, :, 0] > 0).astype(jnp.int32)
+    x = jax.random.normal(jax.random.key(1000), (D, B, T, E))
+    class_ids = (x[..., 0] > 0).astype(jnp.int32)
     y = class_ids
 
     iters = 20
