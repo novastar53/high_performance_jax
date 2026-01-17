@@ -57,12 +57,13 @@ def mha_reference(q, k, v):
 
 # Flash Attention Forward
 
-def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, *, scale, num_k_blocks):
+def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, scale, num_k_blocks):
     """Flash attention forward kernel."""
     q_reg = plgpu.load(q_ref.at[0, :, :]).astype(jnp.float32)
     o_reg = jnp.zeros(q_reg.shape, jnp.float32)
     max_reg = jnp.full((BLOCK_T,), -jnp.inf, dtype=jnp.float32)
     l_reg = jnp.zeros((BLOCK_T,), dtype=jnp.float32)
+    logsumexp_reg = jnp.zeros((BLOCK_T,), dtype=jnp.float32)
 
     def num_body(t, args):
         max_reg, l_reg, o_reg = args
@@ -81,6 +82,7 @@ def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, *, scale, num_k_block
     max_reg, l_reg, o_reg = jax.lax.fori_loop(0, num_k_blocks, num_body, (max_reg, l_reg, o_reg))
     o_reg = o_reg / l_reg[:, None]
     plgpu.store(o_ref.at[0, :, :], o_reg.astype(o_ref.dtype))
+    plgpu.store(logsumexp_ref.at[0, :], logsumexp_reg.astype(logsumexp_ref.dtype))
 
 
 
@@ -97,16 +99,22 @@ def flash_attention_fwd(q, k, v):
 
     grid = (B_flat, pl.cdiv(T, BLOCK_T))
 
-    out_flat = pl.pallas_call(
+    out_flat, logsumexp = pl.pallas_call(
         partial(flash_attention_fwd_kernel, scale=scale, num_k_blocks=num_k_blocks),
-        out_shape=jax.ShapeDtypeStruct(q_flat.shape, q_flat.dtype),
+        out_shape=[
+            jax.ShapeDtypeStruct(q_flat.shape, q_flat.dtype),
+            jax.ShapeDtypeStruct((B*H, T), q_flat.dtype)
+        ],
         grid=grid,
         in_specs=[
             pl.BlockSpec((1, BLOCK_T, C), lambda b, t: (b, t, 0)),
             pl.BlockSpec((1, T, C), lambda b, _: (b, 0, 0)),
             pl.BlockSpec((1, T, C), lambda b, _: (b, 0, 0))
         ],
-        out_specs=pl.BlockSpec((1, BLOCK_T, C), lambda b, t: (b, t, 0)),
+        out_specs=[
+            pl.BlockSpec((1, BLOCK_T, C), lambda b, t: (b, t, 0)),
+            pl.BlockSpec((1, BLOCK_T), lambda b, t: (b, t))
+        ],
         interpret=INTERPRET_MODE,
         compiler_params=plgpu.CompilerParams(
             num_warps=NUM_WARPS,
@@ -114,17 +122,14 @@ def flash_attention_fwd(q, k, v):
         )
     )(q_flat, k_flat, v_flat)
     out = out_flat.reshape(q.shape)
-    return out
-
-
-
-
+    logsumexp = logsumexp.reshape(B, H, T)
+    return out, logsumexp
 
 
 
 # Flash Attention Backward
 
-def flash_attention_bwd_kernel(q_ref, k_ref, v_ref, o_ref, do_ref, l_ref, m_ref,
+def flash_attention_bwd_kernel(q_ref, k_ref, v_ref, o_ref, do_ref, logsumexp_pref,
                                 dq_ref, dk_ref, dv_ref, *, num_kv_blocks, scale):
     """Flash attention backward kernel."""
     pass
@@ -141,7 +146,8 @@ def flash_attention_bwd(q, k, v, o, l, m, do):
 @jax.custom_vjp
 def flash_attention(q, k, v):
     """Flash attention with custom backward pass."""
-    return flash_attention_fwd(q, k, v)
+    o, logsumexp = flash_attention_fwd(q, k, v)
+    return o
 
 
 def flash_attention_fwd_rule(q, k, v):
