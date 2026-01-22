@@ -52,7 +52,10 @@ def mha_reference(q, k, v):
     logits = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
     probs = jax.nn.softmax(logits, axis=-1)
     o = jnp.einsum('bhqk,bhkd->bhqd', probs, v)
-    return o
+    logits_max = jnp.max(logits, axis=-1)
+    logits_shift = logits - logits_max[..., None]
+    logsumexp =  logits_max + jnp.log(jnp.sum(jnp.exp(logits_shift), axis=-1))
+    return o, logsumexp
 
 
 # Flash Attention Forward
@@ -80,6 +83,7 @@ def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, sca
                 o_reg * jnp.exp(max_reg - max_blk)[:, None] + o_blk)
 
     max_reg, l_reg, o_reg = jax.lax.fori_loop(0, num_k_blocks, num_body, (max_reg, l_reg, o_reg))
+    logsumexp_reg = max_reg + jnp.log(l_reg)
     o_reg = o_reg / l_reg[:, None]
     plgpu.store(o_ref.at[0, :, :], o_reg.astype(o_ref.dtype))
     plgpu.store(logsumexp_ref.at[0, :], logsumexp_reg.astype(logsumexp_ref.dtype))
@@ -147,7 +151,7 @@ def flash_attention_bwd(q, k, v, o, l, m, do):
 def flash_attention(q, k, v):
     """Flash attention with custom backward pass."""
     o, logsumexp = flash_attention_fwd(q, k, v)
-    return o
+    return o, logsumexp
 
 
 def flash_attention_fwd_rule(q, k, v):
@@ -186,18 +190,23 @@ if __name__ == "__main__":
     do = jax.random.normal(keys[3], (B, H, T, D), dtype=jnp.float32)
 
     # Forward check
-    o_ref = mha_reference(q, k, v)
+    o_ref, logsumexp_ref = mha_reference(q, k, v)
     print(f"Reference output shape: {o_ref.shape}")
 
     # Backward check (reference)
     def loss_ref(q, k, v):
-        return jnp.sum(mha_reference(q, k, v) * do)
+        O, _ = mha_reference(q, k, v)
+        return jnp.sum(O * do)
 
     dq_ref, dk_ref, dv_ref = jax.grad(loss_ref, argnums=(0, 1, 2))(q, k, v)
     print(f"Reference gradient shapes: dq={dq_ref.shape}, dk={dk_ref.shape}, dv={dv_ref.shape}")
 
-    o_flash = flash_attention(q, k, v)
+    o_flash, logsumexp_flash = flash_attention(q, k, v)
     assert jnp.allclose(o_flash, o_ref, atol=1e-2, rtol=1e-2)
+    print(logsumexp_ref)
+    print("*****")
+    print(logsumexp_flash)
+    assert jnp.allclose(logsumexp_flash, logsumexp_ref, atol=1e-2, rtol=1e-2)
     print("Forward pass check passed!")
     #
     # def loss_flash(q, k, v):
