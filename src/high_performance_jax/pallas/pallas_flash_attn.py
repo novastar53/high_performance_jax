@@ -189,17 +189,38 @@ def flash_attention_bwd_dkv_kernel(
         dV += P^T @ dO
         dK += dS^T @ Q  (where dS = P ⊙ (dP - D))
     """
-    # TODO: Implement
     # Load K, V block for this program
+    k_reg = plgpu.load(k_ref.at[0, :, :]).astype(jnp.float32)
+    v_reg = plgpu.load(v_ref.at[0, :, :]).astype(jnp.float32)
+
     # Initialize dK_acc, dV_acc to zeros
+    dk_acc = jnp.zeros_like(dk_ref, dtype=dk_ref.dtype)
+    dv_acc = jnp.zeros_like(dv_ref, dtype=dv_ref.dtype)
     # Loop over all Q blocks:
+    def body(t, carry):
+        dk_acc, dv_acc = carry
+        idx = pl.dslice(t * BLOCK_R, BLOCK_R)
     #   Load Q, dO, logsumexp, D for current Q block
+        q_blk = plgpu.load(q_ref.at[0, idx, :])
+        do_blk = plgpu.load(do_ref.at[0, idx, :])
+        logsumexp_blk = plgpu.load(logsumexp_ref.at[0, idx])
+        d_blk = plgpu.load(d_ref.at[0, idx])
     #   Recompute P = softmax(Q @ K^T / scale) using logsumexp
+        s_blk = pl.dot(q_blk, k_reg, trans_b=True) / scale
+        p_blk = jnp.exp(s_blk - logsumexp_blk[..., None])
     #   Compute dP = dO @ V^T
+        dp_blk = pl.dot(do_blk, v_reg, trans_b=True)
     #   Compute dS = P * (dP - D)
+        ds_blk = p_blk * (dp_blk - d_blk[..., None]) / scale
     #   Accumulate: dV += P^T @ dO, dK += dS^T @ Q
+        dv_acc += pl.dot(p_blk, do_blk, trans_a=True)
+        dk_acc += pl.dot(ds_blk, q_blk, trans_a=True)
+        return dk_acc, dv_acc
+        
+    dk_acc, dv_acc = jax.lax.fori_loop(0, num_q_blocks, body, (dk_acc, dv_acc))
     # Store dK, dV
-    pass
+    plgpu.store(dk_ref, dk_acc.astype(dk_ref.dtype))
+    plgpu.store(dv_ref, dv_acc.astype(dv_ref.dtype))
 
 
 def flash_attention_bwd_dkv(q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_flat, scale):
@@ -250,17 +271,32 @@ def flash_attention_bwd_dq_kernel(
     For each Q block, we accumulate:
         dQ += dS @ K  (where dS = P ⊙ (dP - D))
     """
-    # TODO: Implement
     # Load Q, dO, logsumexp, D for this Q block
-    # Initialize dQ_acc to zeros
+    q_reg = plgpu.load(q_ref.at[0, :, :]).astype(jnp.float32)
+    do_reg = plgpu.load(do_ref.at[0, :, :]).astype(jnp.float32)
+    logsumexp_reg = plgpu.load(logsumexp_ref.at[0, :]).astype(jnp.float32)
+    d_reg = plgpu.load(d_ref.at[0, :]).astype(jnp.float32)
+    dq_acc = jnp.zeros_like(dq_ref, dtype=dq_ref.dtype)
     # Loop over all KV blocks:
+    def body(t, carry):
+        dq_acc = carry
     #   Load K, V for current KV block
+        idx = pl.dslice(t * BLOCK_C, BLOCK_C)
+        k_blk = plgpu.load(k_ref.at[0, idx, :]).astype(jnp.float32)
+        v_blk = plgpu.load(v_ref.at[0, idx, :]).astype(jnp.float32)
     #   Recompute P = softmax(Q @ K^T / scale) using logsumexp
+        s_blk = pl.dot(q_reg, k_blk, trans_b=True) / scale
+        p_blk = jnp.exp(s_blk - logsumexp_reg[..., None])
     #   Compute dP = dO @ V^T
+        dp_blk = pl.dot(do_reg, v_blk, trans_b=True)
     #   Compute dS = P * (dP - D)
+        ds_blk = p_blk * ( dp_blk - d_reg[..., None] ) / scale
     #   Accumulate: dQ += dS @ K
+        dq_acc += pl.dot(ds_blk, k_blk)
+        return dq_acc
     # Store dQ
-    pass
+    dq_acc = jax.lax.fori_loop(0, num_kv_blocks, body, dq_acc)
+    plgpu.store(dq_ref, dq_acc.astype(dq_ref.dtype))
 
 
 def flash_attention_bwd_dq(q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_flat, scale):
@@ -396,12 +432,20 @@ if __name__ == "__main__":
     assert jnp.allclose(logsumexp_flash, logsumexp_ref, atol=1e-2, rtol=1e-2)
     print("Forward pass check passed!")
 
-    # Test backward pass (uncomment when kernels are implemented)
-    # def loss_flash(q, k, v):
-    #     return jnp.sum(flash_attention(q, k, v) * do)
-    #
-    # dq_flash, dk_flash, dv_flash = jax.grad(loss_flash, argnums=(0, 1, 2))(q, k, v)
-    # assert jnp.allclose(dq_flash, dq_ref, atol=1e-2, rtol=1e-2)
-    # assert jnp.allclose(dk_flash, dk_ref, atol=1e-2, rtol=1e-2)
-    # assert jnp.allclose(dv_flash, dv_ref, atol=1e-2, rtol=1e-2)
-    # print("Backward pass check passed!")
+    # Test preprocess kernel: D = rowsum(O * dO)
+    d_ref = jnp.sum(o_ref * do, axis=-1)  # (B, H, T)
+    o_flat = o_flash.reshape(-1, T, D)
+    do_flat = do.reshape(-1, T, D)
+    d_flash = flash_attention_bwd_preprocess(o_flat, do_flat).reshape(B, H, T)
+    assert jnp.allclose(d_flash, d_ref, atol=1e-2, rtol=1e-2), f"D max diff: {jnp.max(jnp.abs(d_flash - d_ref))}"
+    print("Preprocess kernel (D) check passed!")
+
+    # Test backward pass (dQ only for now, dK/dV return dummy zeros)
+    dq_flash, dk_flash, dv_flash = flash_attention_bwd(q, k, v, o_flash, logsumexp_flash, do)
+    assert jnp.allclose(dq_flash, dq_ref, atol=1e-2, rtol=1e-2), f"dQ max diff: {jnp.max(jnp.abs(dq_flash - dq_ref))}"
+    print("dQ check passed!")
+
+    # dK/dV are dummy zeros for now - uncomment when implemented
+    assert jnp.allclose(dk_flash, dk_ref, atol=1e-2, rtol=1e-2), f"dK max diff: {jnp.max(jnp.abs(dk_flash - dk_ref))}"
+    assert jnp.allclose(dv_flash, dv_ref, atol=1e-2, rtol=1e-2), f"dV max diff: {jnp.max(jnp.abs(dv_flash - dv_ref))}"
+    print("Backward pass check passed!")
