@@ -193,9 +193,9 @@ def flash_attention_bwd_dkv_kernel(
     k_reg = plgpu.load(k_ref.at[0, :, :]).astype(jnp.float32)
     v_reg = plgpu.load(v_ref.at[0, :, :]).astype(jnp.float32)
 
-    # Initialize dK_acc, dV_acc to zeros
-    dk_acc = jnp.zeros_like(dk_ref, dtype=dk_ref.dtype)
-    dv_acc = jnp.zeros_like(dv_ref, dtype=dv_ref.dtype)
+    # Initialize dK_acc, dV_acc to zeros (use float32 for numerical stability)
+    dk_acc = jnp.zeros(dk_ref.shape, dtype=jnp.float32)
+    dv_acc = jnp.zeros(dv_ref.shape, dtype=jnp.float32)
     # Loop over all Q blocks:
     def body(t, carry):
         dk_acc, dv_acc = carry
@@ -276,7 +276,7 @@ def flash_attention_bwd_dq_kernel(
     do_reg = plgpu.load(do_ref.at[0, :, :]).astype(jnp.float32)
     logsumexp_reg = plgpu.load(logsumexp_ref.at[0, :]).astype(jnp.float32)
     d_reg = plgpu.load(d_ref.at[0, :]).astype(jnp.float32)
-    dq_acc = jnp.zeros_like(dq_ref, dtype=dq_ref.dtype)
+    dq_acc = jnp.zeros(dq_ref.shape, dtype=jnp.float32)  # Use float32 for numerical stability
     # Loop over all KV blocks:
     def body(t, carry):
         dq_acc = carry
@@ -456,11 +456,12 @@ if __name__ == "__main__":
     print("="*60)
 
     # Use larger sizes for meaningful timing
+    # Use float16 for cuDNN compatibility
     B_bench, H_bench, T_bench, D_bench = 4, 8, 1024, 64
-    q_bench = jax.random.normal(keys[0], (B_bench, H_bench, T_bench, D_bench), dtype=jnp.float32)
-    k_bench = jax.random.normal(keys[1], (B_bench, H_bench, T_bench, D_bench), dtype=jnp.float32)
-    v_bench = jax.random.normal(keys[2], (B_bench, H_bench, T_bench, D_bench), dtype=jnp.float32)
-    do_bench = jax.random.normal(keys[3], (B_bench, H_bench, T_bench, D_bench), dtype=jnp.float32)
+    q_bench = jax.random.normal(keys[0], (B_bench, H_bench, T_bench, D_bench), dtype=jnp.float16)
+    k_bench = jax.random.normal(keys[1], (B_bench, H_bench, T_bench, D_bench), dtype=jnp.float16)
+    v_bench = jax.random.normal(keys[2], (B_bench, H_bench, T_bench, D_bench), dtype=jnp.float16)
+    do_bench = jax.random.normal(keys[3], (B_bench, H_bench, T_bench, D_bench), dtype=jnp.float16)
 
     print(f"Benchmark shape: B={B_bench}, H={H_bench}, T={T_bench}, D={D_bench}")
 
