@@ -38,7 +38,7 @@ from jax.experimental.pallas import triton as plgpu
 INTERPRET_MODE = False  # Set to False on GPU
 
 BLOCK_R = 64
-BLOCK_C = 128
+BLOCK_C = 64
 NUM_WARPS = 4
 NUM_STAGES = 2
 
@@ -405,7 +405,7 @@ if __name__ == "__main__":
             times.append(time.perf_counter() - t0)
         return sum(times) / len(times)
 
-    B, H, T, D = 2, 4, 256, 64
+    B, H, T, D = 2, 2, 256, 64
     key = jax.random.key(0)
     keys = jax.random.split(key, 4)
 
