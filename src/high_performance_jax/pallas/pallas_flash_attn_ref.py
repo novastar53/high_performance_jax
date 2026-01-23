@@ -468,7 +468,8 @@ def mha_backward_kernel(
   span_q = start_q * block_q_dq + jnp.arange(block_q_dq)
   dq = jnp.zeros([block_q_dq, head_dim_padded], dtype=jnp.float32)
 
-  q = plgpu.load(q_ref.at[curr_q_slice, :], mask=head_mask, other=0.0)
+  q = plgpu.load(q_ref.at[curr_q_slice, :], mask=head_mask, other=0.0
+  
   q_segment_ids = (
       None if segment_ids_ref is None else segment_ids_ref[curr_q_slice]
   )

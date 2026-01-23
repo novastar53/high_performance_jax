@@ -145,11 +145,10 @@ def flash_attention_bwd_preprocess_kernel(o_ref, do_ref, d_ref):
     D is used in the softmax backward: dS = P ⊙ (dP - D)
     where D_i = sum_j(dO_ij * O_ij)
     """
-    # TODO: Implement
-    # Load O and dO blocks
-    # Compute element-wise product and sum over head dimension
-    # Store D
-    pass
+    o_reg = plgpu.load(o_ref).astype(jnp.float32)
+    do_reg = plgpu.load(do_ref).astype(jnp.float32)
+    d_reg = jnp.sum(o_reg * do_reg, axis=-1)
+    plgpu.store(d_ref, d_reg.astype(d_ref.dtype))
 
 
 def flash_attention_bwd_preprocess(o_flat, do_flat):
@@ -296,7 +295,6 @@ def flash_attention_bwd_dq(q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_fl
 def flash_attention_bwd(q, k, v, o, logsumexp, do):
     """Flash attention backward pass using 3 separate kernels."""
     B, H, T, C = q.shape
-    B_flat = B * H
     scale = math.sqrt(C)
 
     # Flatten batch and head dimensions
