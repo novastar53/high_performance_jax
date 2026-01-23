@@ -35,7 +35,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
 
-INTERPRET_MODE = False  # Set to False on GPU
+INTERPRET_MODE = True  # Set to False on GPU
 
 BLOCK_R = 64
 BLOCK_C = 64
@@ -360,6 +360,172 @@ def flash_attention_bwd(q, k, v, o, logsumexp, do):
         dv_flat.reshape(v.shape),
     )
 
+
+# =============================================================================
+# V2: Fused backward kernel (single kernel for dQ, dK, dV)
+# =============================================================================
+# Constraint: BLOCK_R == BLOCK_C (both must be equal)
+# This allows us to use the same grid index as both Q block and KV block index
+
+def flash_attention_bwd_kernel_v2(
+    q_ref, k_ref, v_ref, do_ref, logsumexp_ref, d_ref,
+    dq_ref, dk_ref, dv_ref,
+    *, scale, num_blocks
+):
+    """Fused backward kernel computing dQ, dK, dV in a single kernel.
+
+    Grid: (batch*heads, num_blocks)
+    - program_id(1) is used as BOTH KV block index (scan 1) AND Q block index (scan 2)
+    - Constraint: num_q_blocks == num_kv_blocks, i.e., BLOCK_R == BLOCK_C
+    - All inputs are full sequences; we use block_idx to select which block to load
+
+    Scan 1: Compute dK, dV for block_idx as KV block
+        - Load K, V at block_idx, loop over all Q blocks
+    Scan 2: Compute dQ for block_idx as Q block
+        - Load Q, dO at block_idx, loop over all KV blocks
+    """
+    block_idx = pl.program_id(1)
+    BLOCK = BLOCK_R  # == BLOCK_C
+
+    # =========================================================================
+    # Scan 1: Compute dK, dV
+    # block_idx = KV block index, loop over Q blocks
+    # =========================================================================
+    # Load K, V for this KV block (using block_idx to index into full sequence)
+    kv_idx = pl.dslice(block_idx * BLOCK, BLOCK)
+    k_reg = plgpu.load(k_ref.at[0, kv_idx, :]).astype(jnp.float32)
+    v_reg = plgpu.load(v_ref.at[0, kv_idx, :]).astype(jnp.float32)
+
+    # Accumulators match output ref shapes (1, BLOCK, C)
+    dk_acc = jnp.zeros((1, BLOCK, k_ref.shape[2]), dtype=jnp.float32)
+    dv_acc = jnp.zeros((1, BLOCK, v_ref.shape[2]), dtype=jnp.float32)
+
+    def dkv_body(t, carry):
+        dk_acc, dv_acc = carry
+        idx = pl.dslice(t * BLOCK, BLOCK)
+        # Load Q, dO, logsumexp, D for current Q block
+        q_blk = plgpu.load(q_ref.at[0, idx, :]).astype(jnp.float32)
+        do_blk = plgpu.load(do_ref.at[0, idx, :]).astype(jnp.float32)
+        logsumexp_blk = plgpu.load(logsumexp_ref.at[0, idx]).astype(jnp.float32)
+        d_blk = plgpu.load(d_ref.at[0, idx]).astype(jnp.float32)
+        # Recompute P
+        s_blk = pl.dot(q_blk, k_reg, trans_b=True) / scale
+        p_blk = jnp.exp(s_blk - logsumexp_blk[..., None])
+        # Compute dP, dS
+        dp_blk = pl.dot(do_blk, v_reg, trans_b=True)
+        ds_blk = p_blk * (dp_blk - d_blk[..., None]) / scale
+        # Accumulate dV, dK (add leading dimension for 3D accumulators)
+        dv_acc += pl.dot(p_blk, do_blk, trans_a=True)[None, :, :]
+        dk_acc += pl.dot(ds_blk, q_blk, trans_a=True)[None, :, :]
+        return dk_acc, dv_acc
+
+    dk_acc, dv_acc = jax.lax.fori_loop(0, num_blocks, dkv_body, (dk_acc, dv_acc))
+    plgpu.store(dk_ref, dk_acc.astype(dk_ref.dtype))
+    plgpu.store(dv_ref, dv_acc.astype(dv_ref.dtype))
+
+    # =========================================================================
+    # Scan 2: Compute dQ
+    # block_idx = Q block index, loop over KV blocks
+    # =========================================================================
+    # Load Q, dO, logsumexp, D for this Q block (using block_idx to index into full sequence)
+    q_idx = pl.dslice(block_idx * BLOCK, BLOCK)
+    q_reg = plgpu.load(q_ref.at[0, q_idx, :]).astype(jnp.float32)
+    do_reg = plgpu.load(do_ref.at[0, q_idx, :]).astype(jnp.float32)
+    logsumexp_reg = plgpu.load(logsumexp_ref.at[0, q_idx]).astype(jnp.float32)
+    d_reg = plgpu.load(d_ref.at[0, q_idx]).astype(jnp.float32)
+
+    # Accumulator matches output ref shape (1, BLOCK, C)
+    dq_acc = jnp.zeros((1, BLOCK, q_ref.shape[2]), dtype=jnp.float32)
+
+    def dq_body(t, carry):
+        dq_acc = carry
+        idx = pl.dslice(t * BLOCK, BLOCK)
+        # Load K, V for current KV block
+        k_blk = plgpu.load(k_ref.at[0, idx, :]).astype(jnp.float32)
+        v_blk = plgpu.load(v_ref.at[0, idx, :]).astype(jnp.float32)
+        # Recompute P
+        s_blk = pl.dot(q_reg, k_blk, trans_b=True) / scale
+        p_blk = jnp.exp(s_blk - logsumexp_reg[..., None])
+        # Compute dP, dS
+        dp_blk = pl.dot(do_reg, v_blk, trans_b=True)
+        ds_blk = p_blk * (dp_blk - d_reg[..., None]) / scale
+        # Accumulate dQ (add leading dimension for 3D accumulator)
+        dq_acc += pl.dot(ds_blk, k_blk)[None, :, :]
+        return dq_acc
+
+    dq_acc = jax.lax.fori_loop(0, num_blocks, dq_body, dq_acc)
+    plgpu.store(dq_ref, dq_acc.astype(dq_ref.dtype))
+
+
+def flash_attention_bwd_v2_call(q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_flat, scale):
+    """Pallas call wrapper for fused backward kernel."""
+    B_flat, T, C = q_flat.shape
+    assert BLOCK_R == BLOCK_C, "V2 kernel requires BLOCK_R == BLOCK_C"
+    BLOCK = BLOCK_R
+    num_blocks = pl.cdiv(T, BLOCK)
+    grid = (B_flat, num_blocks)
+
+    dq_flat, dk_flat, dv_flat = pl.pallas_call(
+        partial(flash_attention_bwd_kernel_v2, scale=scale, num_blocks=num_blocks),
+        out_shape=[
+            jax.ShapeDtypeStruct(q_flat.shape, q_flat.dtype),   # dQ
+            jax.ShapeDtypeStruct(k_flat.shape, k_flat.dtype),   # dK
+            jax.ShapeDtypeStruct(v_flat.shape, v_flat.dtype),   # dV
+        ],
+        grid=grid,
+        in_specs=[
+            # All inputs are full sequences - kernel uses block_idx to select blocks
+            pl.BlockSpec((1, T, C), lambda b, _: (b, 0, 0)),       # q (full)
+            pl.BlockSpec((1, T, C), lambda b, _: (b, 0, 0)),       # k (full)
+            pl.BlockSpec((1, T, C), lambda b, _: (b, 0, 0)),       # v (full)
+            pl.BlockSpec((1, T, C), lambda b, _: (b, 0, 0)),       # do (full)
+            pl.BlockSpec((1, T), lambda b, _: (b, 0)),             # logsumexp (full)
+            pl.BlockSpec((1, T), lambda b, _: (b, 0)),             # d (full)
+        ],
+        out_specs=[
+            # Outputs are blocked - each program writes one block
+            pl.BlockSpec((1, BLOCK, C), lambda b, t: (b, t, 0)),   # dq (blocked)
+            pl.BlockSpec((1, BLOCK, C), lambda b, t: (b, t, 0)),   # dk (blocked)
+            pl.BlockSpec((1, BLOCK, C), lambda b, t: (b, t, 0)),   # dv (blocked)
+        ],
+        interpret=INTERPRET_MODE,
+        compiler_params=plgpu.CompilerParams(
+            num_warps=NUM_WARPS,
+            num_stages=NUM_STAGES
+        )
+    )(q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_flat)
+    return dq_flat, dk_flat, dv_flat
+
+
+@jax.jit
+def flash_attention_bwd_v2(q, k, v, o, logsumexp, do):
+    """Flash attention backward pass V2: fused single kernel."""
+    B, H, T, C = q.shape
+    scale = math.sqrt(C)
+
+    # Flatten batch and head dimensions
+    q_flat = q.reshape(-1, T, C)
+    k_flat = k.reshape(-1, T, C)
+    v_flat = v.reshape(-1, T, C)
+    o_flat = o.reshape(-1, T, C)
+    do_flat = do.reshape(-1, T, C)
+    logsumexp_flat = logsumexp.reshape(-1, T)
+
+    # Kernel 1: Preprocess - compute D = rowsum(O ⊙ dO)
+    d_flat = flash_attention_bwd_preprocess(o_flat, do_flat)
+
+    # Kernel 2: Fused dQ, dK, dV
+    dq_flat, dk_flat, dv_flat = flash_attention_bwd_v2_call(
+        q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_flat, scale
+    )
+
+    return (
+        dq_flat.reshape(q.shape),
+        dk_flat.reshape(k.shape),
+        dv_flat.reshape(v.shape),
+    )
+
+
 # Custom VJP wrapper
 
 @jax.custom_vjp
@@ -390,6 +556,31 @@ def flash_attention_bwd_rule(res, do):
 
 
 flash_attention.defvjp(flash_attention_fwd_rule, flash_attention_bwd_rule)
+
+
+# V2 Custom VJP wrapper (uses fused backward kernel)
+
+@jax.custom_vjp
+def flash_attention_v2(q, k, v):
+    """Flash attention V2 with fused backward pass."""
+    o, _ = flash_attention_fwd(q, k, v)
+    return o
+
+
+def flash_attention_v2_fwd_rule(q, k, v):
+    """Forward rule for custom_vjp."""
+    o, logsumexp = flash_attention_fwd(q, k, v)
+    return o, (q, k, v, o, logsumexp)
+
+
+def flash_attention_v2_bwd_rule(res, do):
+    """Backward rule using fused V2 kernel."""
+    q, k, v, o, logsumexp = res
+    dq, dk, dv = flash_attention_bwd_v2(q, k, v, o, logsumexp, do)
+    return dq, dk, dv
+
+
+flash_attention_v2.defvjp(flash_attention_v2_fwd_rule, flash_attention_v2_bwd_rule)
 
 
 if __name__ == "__main__":
@@ -445,10 +636,16 @@ if __name__ == "__main__":
     assert jnp.allclose(dq_flash, dq_ref, atol=1e-2, rtol=1e-2), f"dQ max diff: {jnp.max(jnp.abs(dq_flash - dq_ref))}"
     print("dQ check passed!")
 
-    # dK/dV are dummy zeros for now - uncomment when implemented
     assert jnp.allclose(dk_flash, dk_ref, atol=1e-2, rtol=1e-2), f"dK max diff: {jnp.max(jnp.abs(dk_flash - dk_ref))}"
     assert jnp.allclose(dv_flash, dv_ref, atol=1e-2, rtol=1e-2), f"dV max diff: {jnp.max(jnp.abs(dv_flash - dv_ref))}"
-    print("Backward pass check passed!")
+    print("Backward pass V1 (3 kernels) check passed!")
+
+    # Test backward pass V2 (fused kernel)
+    dq_flash_v2, dk_flash_v2, dv_flash_v2 = flash_attention_bwd_v2(q, k, v, o_flash, logsumexp_flash, do)
+    assert jnp.allclose(dq_flash_v2, dq_ref, atol=1e-2, rtol=1e-2), f"V2 dQ max diff: {jnp.max(jnp.abs(dq_flash_v2 - dq_ref))}"
+    assert jnp.allclose(dk_flash_v2, dk_ref, atol=1e-2, rtol=1e-2), f"V2 dK max diff: {jnp.max(jnp.abs(dk_flash_v2 - dk_ref))}"
+    assert jnp.allclose(dv_flash_v2, dv_ref, atol=1e-2, rtol=1e-2), f"V2 dV max diff: {jnp.max(jnp.abs(dv_flash_v2 - dv_ref))}"
+    print("Backward pass V2 (fused kernel) check passed!")
 
     # Timing comparison with JAX built-in dot_product_attention
     print("\n" + "="*60)
@@ -503,10 +700,15 @@ if __name__ == "__main__":
         out = jax.nn.dot_product_attention(q_t, k_t, v_t, implementation='cudnn')
         return jnp.transpose(out, (0, 2, 1, 3))  # Back to (B, H, T, D)
 
-    # Our flash attention (returns only output, not logsumexp)
+    # Our flash attention V1 (3 separate backward kernels)
     @jax.jit
-    def our_flash_attention(q, k, v):
+    def our_flash_attention_v1(q, k, v):
         return flash_attention(q, k, v)
+
+    # Our flash attention V2 (fused backward kernel)
+    @jax.jit
+    def our_flash_attention_v2(q, k, v):
+        return flash_attention_v2(q, k, v)
 
     # Reference (materialized attention matrix)
     @jax.jit
@@ -517,7 +719,7 @@ if __name__ == "__main__":
     print("\nForward pass:")
     t_jax = _bench_fwd(jax_dot_product_attention, q_bench, k_bench, v_bench)
     print(f"  JAX dot_product_attention: {t_jax:.3f} ms")
-    t_ours = _bench_fwd(our_flash_attention, q_bench, k_bench, v_bench)
+    t_ours = _bench_fwd(our_flash_attention_v1, q_bench, k_bench, v_bench)
     print(f"  Our flash_attention:       {t_ours:.3f} ms")
     t_ref = _bench_fwd(reference_attention, q_bench, k_bench, v_bench)
     print(f"  Reference (materialized):  {t_ref:.3f} ms")
@@ -525,7 +727,9 @@ if __name__ == "__main__":
     print("\nBackward pass:")
     t_jax_bwd = _bench_bwd(jax_dot_product_attention, q_bench, k_bench, v_bench, do_bench)
     print(f"  JAX dot_product_attention: {t_jax_bwd:.3f} ms")
-    t_ours_bwd = _bench_bwd(our_flash_attention, q_bench, k_bench, v_bench, do_bench)
-    print(f"  Our flash_attention:       {t_ours_bwd:.3f} ms")
+    t_ours_v1_bwd = _bench_bwd(our_flash_attention_v1, q_bench, k_bench, v_bench, do_bench)
+    print(f"  Our flash_attention V1:    {t_ours_v1_bwd:.3f} ms (3 kernels)")
+    t_ours_v2_bwd = _bench_bwd(our_flash_attention_v2, q_bench, k_bench, v_bench, do_bench)
+    print(f"  Our flash_attention V2:    {t_ours_v2_bwd:.3f} ms (fused)")
     t_ref_bwd = _bench_bwd(reference_attention, q_bench, k_bench, v_bench, do_bench)
     print(f"  Reference (materialized):  {t_ref_bwd:.3f} ms")
