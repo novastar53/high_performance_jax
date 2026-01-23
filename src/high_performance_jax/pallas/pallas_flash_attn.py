@@ -35,7 +35,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
 
-INTERPRET_MODE = True  # Set to False on GPU
+INTERPRET_MODE = False  # Set to False on GPU
 
 BLOCK_R = 64
 BLOCK_C = 128
@@ -499,7 +499,7 @@ if __name__ == "__main__":
         q_t = jnp.transpose(q, (0, 2, 1, 3))
         k_t = jnp.transpose(k, (0, 2, 1, 3))
         v_t = jnp.transpose(v, (0, 2, 1, 3))
-        out = jax.nn.dot_product_attention(q_t, k_t, v_t)
+        out = jax.nn.dot_product_attention(q_t, k_t, v_t, implementation='cudnn')
         return jnp.transpose(out, (0, 2, 1, 3))  # Back to (B, H, T, D)
 
     # Our flash attention (returns only output, not logsumexp)
