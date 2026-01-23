@@ -449,3 +449,82 @@ if __name__ == "__main__":
     assert jnp.allclose(dk_flash, dk_ref, atol=1e-2, rtol=1e-2), f"dK max diff: {jnp.max(jnp.abs(dk_flash - dk_ref))}"
     assert jnp.allclose(dv_flash, dv_ref, atol=1e-2, rtol=1e-2), f"dV max diff: {jnp.max(jnp.abs(dv_flash - dv_ref))}"
     print("Backward pass check passed!")
+
+    # Timing comparison with JAX built-in dot_product_attention
+    print("\n" + "="*60)
+    print("Timing Comparison")
+    print("="*60)
+
+    # Use larger sizes for meaningful timing
+    B_bench, H_bench, T_bench, D_bench = 4, 8, 1024, 64
+    q_bench = jax.random.normal(keys[0], (B_bench, H_bench, T_bench, D_bench), dtype=jnp.float32)
+    k_bench = jax.random.normal(keys[1], (B_bench, H_bench, T_bench, D_bench), dtype=jnp.float32)
+    v_bench = jax.random.normal(keys[2], (B_bench, H_bench, T_bench, D_bench), dtype=jnp.float32)
+    do_bench = jax.random.normal(keys[3], (B_bench, H_bench, T_bench, D_bench), dtype=jnp.float32)
+
+    print(f"Benchmark shape: B={B_bench}, H={H_bench}, T={T_bench}, D={D_bench}")
+
+    def _bench_fwd(fn, q, k, v, iters=20):
+        # Warmup
+        for _ in range(3):
+            out = fn(q, k, v)
+            jax.block_until_ready(out)
+        # Bench
+        times = []
+        for _ in range(iters):
+            t0 = time.perf_counter()
+            out = fn(q, k, v)
+            jax.block_until_ready(out)
+            times.append(time.perf_counter() - t0)
+        return sum(times) / len(times) * 1000  # ms
+
+    def _bench_bwd(fn, q, k, v, do, iters=20):
+        # Warmup
+        for _ in range(3):
+            grads = jax.grad(lambda q, k, v: jnp.sum(fn(q, k, v) * do), argnums=(0, 1, 2))(q, k, v)
+            jax.block_until_ready(grads)
+        # Bench
+        times = []
+        for _ in range(iters):
+            t0 = time.perf_counter()
+            grads = jax.grad(lambda q, k, v: jnp.sum(fn(q, k, v) * do), argnums=(0, 1, 2))(q, k, v)
+            jax.block_until_ready(grads)
+            times.append(time.perf_counter() - t0)
+        return sum(times) / len(times) * 1000  # ms
+
+    # JAX built-in (note: different input layout - expects (B, T, H, D))
+    @jax.jit
+    def jax_dot_product_attention(q, k, v):
+        # Transpose from (B, H, T, D) to (B, T, H, D) for jax.nn.dot_product_attention
+        q_t = jnp.transpose(q, (0, 2, 1, 3))
+        k_t = jnp.transpose(k, (0, 2, 1, 3))
+        v_t = jnp.transpose(v, (0, 2, 1, 3))
+        out = jax.nn.dot_product_attention(q_t, k_t, v_t)
+        return jnp.transpose(out, (0, 2, 1, 3))  # Back to (B, H, T, D)
+
+    # Our flash attention (returns only output, not logsumexp)
+    @jax.jit
+    def our_flash_attention(q, k, v):
+        return flash_attention(q, k, v)
+
+    # Reference (materialized attention matrix)
+    @jax.jit
+    def reference_attention(q, k, v):
+        o, _ = mha_reference(q, k, v)
+        return o
+
+    print("\nForward pass:")
+    t_jax = _bench_fwd(jax_dot_product_attention, q_bench, k_bench, v_bench)
+    print(f"  JAX dot_product_attention: {t_jax:.3f} ms")
+    t_ours = _bench_fwd(our_flash_attention, q_bench, k_bench, v_bench)
+    print(f"  Our flash_attention:       {t_ours:.3f} ms")
+    t_ref = _bench_fwd(reference_attention, q_bench, k_bench, v_bench)
+    print(f"  Reference (materialized):  {t_ref:.3f} ms")
+
+    print("\nBackward pass:")
+    t_jax_bwd = _bench_bwd(jax_dot_product_attention, q_bench, k_bench, v_bench, do_bench)
+    print(f"  JAX dot_product_attention: {t_jax_bwd:.3f} ms")
+    t_ours_bwd = _bench_bwd(our_flash_attention, q_bench, k_bench, v_bench, do_bench)
+    print(f"  Our flash_attention:       {t_ours_bwd:.3f} ms")
+    t_ref_bwd = _bench_bwd(reference_attention, q_bench, k_bench, v_bench, do_bench)
+    print(f"  Reference (materialized):  {t_ref_bwd:.3f} ms")
