@@ -201,10 +201,10 @@ def flash_attention_bwd_dkv_kernel(
         dk_acc, dv_acc = carry
         idx = pl.dslice(t * BLOCK_R, BLOCK_R)
     #   Load Q, dO, logsumexp, D for current Q block
-        q_blk = plgpu.load(q_ref.at[0, idx, :])
-        do_blk = plgpu.load(do_ref.at[0, idx, :])
-        logsumexp_blk = plgpu.load(logsumexp_ref.at[0, idx])
-        d_blk = plgpu.load(d_ref.at[0, idx])
+        q_blk = plgpu.load(q_ref.at[0, idx, :]).astype(jnp.float32)
+        do_blk = plgpu.load(do_ref.at[0, idx, :]).astype(jnp.float32)
+        logsumexp_blk = plgpu.load(logsumexp_ref.at[0, idx]).astype(jnp.float32)
+        d_blk = plgpu.load(d_ref.at[0, idx]).astype(jnp.float32)
     #   Recompute P = softmax(Q @ K^T / scale) using logsumexp
         s_blk = pl.dot(q_blk, k_reg, trans_b=True) / scale
         p_blk = jnp.exp(s_blk - logsumexp_blk[..., None])
