@@ -26,7 +26,7 @@ from high_performance_jax.profiling import (
     print_traces,
     get_trace_dir,
 )
-from high_performance_jax.pallas.pallas_flash_attn import flash_attention, mha_reference
+from high_performance_jax.pallas.pallas_flash_attn import flash_attention, mha_reference, cudnn_attention
 
 
 def profile_attention(B: int, H: int, T: int, D: int, dtype=jnp.float16):
@@ -66,6 +66,20 @@ def profile_attention(B: int, H: int, T: int, D: int, dtype=jnp.float16):
     profile_function(
         f"reference_attention_B{B}_H{H}_T{T}_D{D}",
         lambda: jax.block_until_ready(ref_fwd_bwd(q, k, v))
+    )
+
+    # cuDNN attention forward+backward
+    def cudnn_loss(q, k, v):
+        return jnp.sum(cudnn_attention(q, k, v) * do)
+
+    cudnn_fwd_bwd = jax.jit(jax.value_and_grad(cudnn_loss, argnums=(0, 1, 2)))
+
+    print("\n" + "="*60)
+    print("Profiling: cuDNN Attention (forward + backward)")
+    print("="*60)
+    profile_function(
+        f"cudnn_attention_B{B}_H{H}_T{T}_D{D}",
+        lambda: jax.block_until_ready(cudnn_fwd_bwd(q, k, v))
     )
 
 
