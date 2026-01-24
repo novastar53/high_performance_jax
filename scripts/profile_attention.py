@@ -8,13 +8,14 @@ Usage:
     # On remote GPU machine:
     python scripts/profile_attention.py
 
-    # Then start xprof server:
+    # Option 1: View remotely via SSH tunnel
     python scripts/profile_attention.py --serve
-
-    # From local machine, SSH tunnel:
-    make xprof-tunnel h=<remote_host> k=<keyfile>
-
+    # From local: make xprof-tunnel h=<remote_host> k=<keyfile>
     # Open http://localhost:8791 in browser
+
+    # Option 2: Download traces and view locally
+    # From local: make download-traces h=<remote_host> k=<keyfile>
+    # Then: make xprof-serve
 """
 
 import argparse
@@ -34,6 +35,7 @@ from high_performance_jax.profiling import (
     profile_function,
     start_xprof_server,
     print_traces,
+    get_trace_dir,
 )
 from high_performance_jax.pallas.pallas_flash_attn import (
     flash_attention,
@@ -129,8 +131,8 @@ def main():
     parser.add_argument("--serve", action="store_true", help="Start xprof server")
     parser.add_argument("--list", action="store_true", help="List available traces")
     parser.add_argument("--port", type=int, default=8791, help="xprof server port")
-    parser.add_argument("--trace-dir", type=str, default="/tmp/jax-traces",
-                       help="Directory for traces")
+    parser.add_argument("--trace-dir", type=str, default=None,
+                       help="Directory for traces (default: repo/traces)")
     parser.add_argument("--batch", type=int, default=4, help="Batch size")
     parser.add_argument("--heads", type=int, default=8, help="Number of attention heads")
     parser.add_argument("--seq-len", type=int, default=1024, help="Sequence length")
@@ -141,8 +143,9 @@ def main():
 
     args = parser.parse_args()
 
-    # Configure profiling
-    configure(trace_dir=args.trace_dir)
+    # Configure profiling (only if trace_dir is explicitly provided)
+    if args.trace_dir:
+        configure(trace_dir=args.trace_dir)
 
     if args.serve:
         start_xprof_server(port=args.port)
@@ -155,6 +158,7 @@ def main():
     # Print device info
     print(f"JAX devices: {jax.devices()}")
     print(f"Default backend: {jax.default_backend()}")
+    print(f"Traces will be saved to: {get_trace_dir()}")
 
     if args.scaling:
         profile_memory_scaling()
@@ -170,9 +174,13 @@ def main():
     print("Profiling complete!")
     print("="*60)
     print("\nTo view traces:")
-    print(f"  1. Start server: python {__file__} --serve")
-    print(f"  2. SSH tunnel:   make xprof-tunnel h=<host> k=<keyfile>")
-    print(f"  3. Open:         http://localhost:{args.port}")
+    print("  Option 1 (remote): Start server and SSH tunnel")
+    print(f"    python {__file__} --serve")
+    print(f"    make xprof-tunnel h=<host> k=<keyfile>")
+    print(f"    Open http://localhost:{args.port}")
+    print("\n  Option 2 (local): Download traces and view locally")
+    print("    make download-traces h=<host> k=<keyfile>")
+    print("    make xprof-serve")
 
 
 if __name__ == "__main__":

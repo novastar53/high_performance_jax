@@ -61,35 +61,54 @@ profile_comparison(
 quick_profile("matmul", lambda: (x @ y).block_until_ready())
 ```
 
-### Remote Profiling Workflow
+### Profiling Workflow
+
+Traces are saved to `traces/{YYYY-MM-DD}/{name}/` within the repository, organized by date.
+
+#### Option 1: Download Traces (Recommended)
+
+This approach downloads traces to your local machine so you can analyze them at leisure without keeping a GPU running.
 
 1. **On the remote GPU machine**, run your profiling script:
    ```bash
    python scripts/profile_attention.py --seq-len 1024 --backward
    ```
 
-2. **Start the xprof server** on the remote machine:
+2. **Download traces** to your local machine:
    ```bash
-   python scripts/profile_attention.py --serve
-   # Or directly:
-   python -m high_performance_jax.profiling serve
+   make download-traces h=<remote_host> k=<keyfile>
    ```
 
-3. **SSH tunnel** from your local machine:
+3. **View locally** with xprof:
+   ```bash
+   make xprof-serve
+   # Open http://localhost:8791 in your browser
+   ```
+
+#### Option 2: SSH Tunnel (Real-time)
+
+View traces in real-time while connected to the remote machine.
+
+1. **On the remote GPU machine**, run profiling and start the server:
+   ```bash
+   python scripts/profile_attention.py --seq-len 1024 --backward
+   python scripts/profile_attention.py --serve
+   ```
+
+2. **SSH tunnel** from your local machine:
    ```bash
    make xprof-tunnel h=<remote_host> k=<keyfile>
-   # Or manually:
-   ssh -L 8791:localhost:8791 -i <keyfile> user@<remote_host>
    ```
 
-4. **Open** http://localhost:8791 in your browser to view traces.
+3. **Open** http://localhost:8791 in your browser.
 
 ### Makefile Commands
 
 ```bash
-make xprof-tunnel h=<host> k=<keyfile>  # SSH tunnel for remote profiling
-make xprof-serve dir=/tmp/jax-traces    # Start xprof server locally
-make xprof-list                          # List available traces
+make download-traces h=<host> k=<keyfile>  # Download traces from remote
+make xprof-serve                            # Start xprof server locally
+make xprof-list                             # List available traces
+make xprof-tunnel h=<host> k=<keyfile>      # SSH tunnel for remote viewing
 ```
 
 ## Key Patterns

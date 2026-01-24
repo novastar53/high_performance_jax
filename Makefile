@@ -110,13 +110,21 @@ xprof-tunnel:
 	@echo "Open http://localhost:8791 in your browser"
 	ssh -L 8791:localhost:8791 -i '${k}' ubuntu@${h}
 
-# Start xprof server locally (usage: make xprof-serve [dir=/path/to/traces])
+# Start xprof server locally (usage: make xprof-serve [dir=traces])
 xprof-serve:
-	xprof --port 8791 ${dir:-/tmp/jax-traces}
+	xprof --port 8791 ${dir:-traces}
 
 # List available traces
 xprof-list:
-	@ls -la /tmp/jax-traces 2>/dev/null || echo "No traces found in /tmp/jax-traces"
+	@uv run python -m high_performance_jax.profiling list
+
+# Download traces from remote machine (usage: make download-traces h=hostname k=keyfile [remote_dir=traces])
+download-traces:
+	@echo "Downloading traces from ${h}..."
+	@mkdir -p traces
+	rsync -avz --progress -e "ssh -i '${k}'" ubuntu@${h}:~/high_performance_jax/${remote_dir:-traces}/ ./traces/
+	@echo "Traces downloaded to ./traces/"
+	@echo "View with: make xprof-serve"
 
 # Run Jupyter lab
 lab:
@@ -142,7 +150,8 @@ help:
 	@echo "  make list      - Show installed packages"
 	@echo "  make lab       - Run Jupyter lab"
 	@echo "  make jupyter-ssh-tunnel - SSH tunnel to Jupyter lab"
-	@echo "  make xprof-tunnel - SSH tunnel for xprof profiling (h=host k=keyfile)"
-	@echo "  make xprof-serve  - Start xprof server locally (dir=/path/to/traces)"
+	@echo "  make download-traces - Download traces from remote (h=host k=keyfile)"
+	@echo "  make xprof-serve  - Start xprof server locally"
 	@echo "  make xprof-list   - List available traces"
+	@echo "  make xprof-tunnel - SSH tunnel for xprof (h=host k=keyfile)"
 	@echo "  make help      - Show this help message"
