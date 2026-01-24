@@ -3,6 +3,9 @@
 # Default Python version
 PYTHON_VERSION ?= 3.12.8
 
+# Default SSH port
+p ?= 22
+
 # Detect platform
 UNAME_M := $(shell uname -m)
 UNAME_S := $(shell uname -s)
@@ -101,28 +104,37 @@ build: wheel sdist
 list:
 	uv pip list
 
+# SSH tunnel for Jupyter (usage: make jupyter-ssh-tunnel h=hostname k=keyfile [p=port])
 jupyter-ssh-tunnel:
-	ssh -L 8888:localhost:8888 -L 6006:localhost:6006 -i '${k}' ubuntu@${h}
+	ssh -L 8888:localhost:8888 -L 6006:localhost:6006 -p $(p) -i '$(k)' root@$(h)
 
-# SSH tunnel for xprof profiling (usage: make xprof-tunnel h=hostname k=keyfile)
+# SSH tunnel for xprof profiling (usage: make xprof-tunnel h=hostname k=keyfile [p=port])
 xprof-tunnel:
 	@echo "Starting SSH tunnel for xprof on port 8791..."
 	@echo "Open http://localhost:8791 in your browser"
-	ssh -L 8791:localhost:8791 -i '${k}' ubuntu@${h}
+	ssh -L 8791:localhost:8791 -p $(p) -i '$(k)' root@$(h)
 
-# Start xprof server locally (usage: make xprof-serve [dir=traces])
+# Start xprof server locally (usage: make xprof-serve dir=<trace_path>)
+# Example: make xprof-serve dir=traces/2026-01-24/attention_fwd_B4_H8_T1024_D64_flash_attention
 xprof-serve:
-	xprof --port 8791 ${dir:-traces}
+	@if [ -z "$(dir)" ]; then \
+		echo "Available traces:"; \
+		find traces -name "*.xplane.pb" -exec dirname {} \; 2>/dev/null | sed 's|/plugins/profile/.*||' | sort -u; \
+		echo ""; \
+		echo "Usage: make xprof-serve dir=<trace_path>"; \
+	else \
+		uv run xprof --port 8791 $(dir); \
+	fi
 
 # List available traces
 xprof-list:
 	@uv run python -m high_performance_jax.profiling list
 
-# Download traces from remote machine (usage: make download-traces h=hostname k=keyfile [remote_dir=traces])
+# Download traces from remote machine (usage: make download-traces h=hostname k=keyfile [p=port])
 download-traces:
-	@echo "Downloading traces from ${h}..."
+	@echo "Downloading traces from $(h)..."
 	@mkdir -p traces
-	rsync -avz --progress -e "ssh -i '${k}'" ubuntu@${h}:~/high_performance_jax/${remote_dir:-traces}/ ./traces/
+	scp -r -P $(p) -i '$(k)' root@$(h):/root/high_performance_jax/traces/* ./traces/
 	@echo "Traces downloaded to ./traces/"
 	@echo "View with: make xprof-serve"
 
@@ -149,9 +161,9 @@ help:
 	@echo "  make sdist     - Create source distribution"
 	@echo "  make list      - Show installed packages"
 	@echo "  make lab       - Run Jupyter lab"
-	@echo "  make jupyter-ssh-tunnel - SSH tunnel to Jupyter lab"
-	@echo "  make download-traces - Download traces from remote (h=host k=keyfile)"
+	@echo "  make jupyter-ssh-tunnel - SSH tunnel to Jupyter lab (h=host k=keyfile [p=port])"
+	@echo "  make download-traces - Download traces from remote (h=host k=keyfile [p=port])"
 	@echo "  make xprof-serve  - Start xprof server locally"
 	@echo "  make xprof-list   - List available traces"
-	@echo "  make xprof-tunnel - SSH tunnel for xprof (h=host k=keyfile)"
+	@echo "  make xprof-tunnel - SSH tunnel for xprof (h=host k=keyfile [p=port])"
 	@echo "  make help      - Show this help message"

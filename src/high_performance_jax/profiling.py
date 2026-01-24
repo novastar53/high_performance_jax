@@ -72,8 +72,8 @@ class ProfileConfig:
     host_tracer_level: int = 2  # 0=disabled, 1=user events, 2=default, 3=verbose
     device_tracer_level: int = 1  # 0=disabled, 1=enabled
     python_tracer_level: int = 0  # 0=disabled, 1=enabled
-    warmup_iters: int = 3
-    profile_iters: int = 1
+    warmup_iters: int = 5  # Warmup iterations (outside trace) to ensure JIT compilation
+    profile_iters: int = 3  # Iterations to profile (after skip_first_in_trace)
     organize_by_date: bool = True  # Organize traces by date
 
     def __post_init__(self):
@@ -177,6 +177,7 @@ def profile_function(
     fn: Callable[[], Any],
     warmup_iters: int | None = None,
     profile_iters: int | None = None,
+    skip_first_in_trace: bool = True,
 ) -> Path:
     """Profile a function with warmup iterations.
 
@@ -185,6 +186,9 @@ def profile_function(
         fn: Function to profile (should call block_until_ready internally or return arrays)
         warmup_iters: Number of warmup iterations (default from config)
         profile_iters: Number of iterations to profile (default from config)
+        skip_first_in_trace: If True, run one extra iteration at the start of the trace
+                            to capture any remaining lazy compilation, then profile
+                            the subsequent iterations (default True)
 
     Returns:
         Path to the trace directory
@@ -192,24 +196,29 @@ def profile_function(
     warmup = warmup_iters if warmup_iters is not None else _config.warmup_iters
     iters = profile_iters if profile_iters is not None else _config.profile_iters
 
-    # Warmup
-    print(f"Warming up ({warmup} iterations)...")
-    for _ in range(warmup):
+    def _run_and_wait():
         result = fn()
         if hasattr(result, 'block_until_ready'):
             result.block_until_ready()
         elif isinstance(result, (list, tuple)):
             jax.block_until_ready(result)
 
+    # Warmup (outside trace)
+    print(f"Warming up ({warmup} iterations)...")
+    for _ in range(warmup):
+        _run_and_wait()
+
     # Profile
     trace_path = _get_trace_path(name)
     with profile(name):
+        if skip_first_in_trace:
+            # Run one iteration to capture any lazy compilation
+            # This iteration is included in trace but subsequent iterations are cleaner
+            _run_and_wait()
+
+        # These are the "clean" iterations we care about
         for _ in range(iters):
-            result = fn()
-            if hasattr(result, 'block_until_ready'):
-                result.block_until_ready()
-            elif isinstance(result, (list, tuple)):
-                jax.block_until_ready(result)
+            _run_and_wait()
 
     return trace_path
 
@@ -388,7 +397,7 @@ def quick_profile(name: str, fn: Callable[[], Any]) -> Path:
     Usage:
         quick_profile("matmul", lambda: (x @ y).block_until_ready())
     """
-    return profile_function(name, fn, warmup_iters=3, profile_iters=1)
+    return profile_function(name, fn, warmup_iters=5, profile_iters=3, skip_first_in_trace=True)
 
 
 if __name__ == "__main__":
