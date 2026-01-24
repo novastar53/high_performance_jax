@@ -40,7 +40,7 @@ INTERPRET_MODE = False  # Set to False on GPU
 BLOCK_R = 64
 BLOCK_C = 64
 NUM_WARPS = 4
-NUM_STAGES = 2
+NUM_STAGES = 3
 
 
 # Reference implementation
@@ -457,7 +457,7 @@ if __name__ == "__main__":
 
     # Use larger sizes for meaningful timing
     # Use float16 for cuDNN compatibility
-    B_bench, H_bench, T_bench, D_bench = 4, 8, 1024, 64
+    B_bench, H_bench, T_bench, D_bench = 4, 8, 2048, 64
     q_bench = jax.random.normal(keys[0], (B_bench, H_bench, T_bench, D_bench), dtype=jnp.float16)
     k_bench = jax.random.normal(keys[1], (B_bench, H_bench, T_bench, D_bench), dtype=jnp.float16)
     v_bench = jax.random.normal(keys[2], (B_bench, H_bench, T_bench, D_bench), dtype=jnp.float16)

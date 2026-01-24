@@ -87,7 +87,7 @@ def main():
     parser.add_argument("--batch", type=int, default=4, help="Batch size")
     parser.add_argument("--heads", type=int, default=8, help="Number of attention heads")
     parser.add_argument("--seq-len", type=int, default=2048, help="Sequence length")
-    parser.add_argument("--head-dim", type=int, default=64, help="Head dimension")
+    parser.add_argument("--head-dim", type=int, default=128, help="Head dimension")
 
     args = parser.parse_args()
 
