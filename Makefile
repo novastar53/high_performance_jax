@@ -104,6 +104,20 @@ list:
 jupyter-ssh-tunnel:
 	ssh -L 8888:localhost:8888 -L 6006:localhost:6006 -i '${k}' ubuntu@${h}
 
+# SSH tunnel for xprof profiling (usage: make xprof-tunnel h=hostname k=keyfile)
+xprof-tunnel:
+	@echo "Starting SSH tunnel for xprof on port 8791..."
+	@echo "Open http://localhost:8791 in your browser"
+	ssh -L 8791:localhost:8791 -i '${k}' ubuntu@${h}
+
+# Start xprof server locally (usage: make xprof-serve [dir=/path/to/traces])
+xprof-serve:
+	xprof --port 8791 ${dir:-/tmp/jax-traces}
+
+# List available traces
+xprof-list:
+	@ls -la /tmp/jax-traces 2>/dev/null || echo "No traces found in /tmp/jax-traces"
+
 # Run Jupyter lab
 lab:
 	cd notebooks && nohup uv run jupyter lab --NotebookApp.iopub_data_rate_limit=1.0e10 --NotebookApp.rate_limit_window=10.0 --no-browser --port=8888 > jupyter.log 2>&1 &
@@ -126,6 +140,9 @@ help:
 	@echo "  make wheel     - Create wheel distribution"
 	@echo "  make sdist     - Create source distribution"
 	@echo "  make list      - Show installed packages"
-	@echo "  make lab       - Run Jupyter lab" 
+	@echo "  make lab       - Run Jupyter lab"
 	@echo "  make jupyter-ssh-tunnel - SSH tunnel to Jupyter lab"
+	@echo "  make xprof-tunnel - SSH tunnel for xprof profiling (h=host k=keyfile)"
+	@echo "  make xprof-serve  - Start xprof server locally (dir=/path/to/traces)"
+	@echo "  make xprof-list   - List available traces"
 	@echo "  make help      - Show this help message"
