@@ -263,10 +263,11 @@ def generate_roofline_plot(
     memory_roof = gpu["peak_bandwidth_gb_s"] * ai_range / 1000.0  # GB/s -> GFLOP/s
 
     # Compute roof (horizontal)
-    compute_roof = gpu["peak_compute_tflops"] * np.ones_like(ai_range)
+    compute_roof = gpu["peak_compute_tflops"] * 1000 * np.ones_like(ai_range)  # TFLOP/s -> GFLOP/s
 
-    # Ridge point
-    ridge_ai = gpu["ridge_ai"]
+    # CRITICAL FIX: Cap memory roof at compute roof
+    # Memory roof should not exceed compute roof after ridge point
+    memory_roof = np.minimum(memory_roof, compute_roof)
 
     # Plot roofs
     ax.plot(ai_range, memory_roof, 'k--', linewidth=2, alpha=0.7, label='Memory roof')
