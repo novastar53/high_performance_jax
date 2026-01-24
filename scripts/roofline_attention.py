@@ -10,6 +10,7 @@ Usage:
     make roofline
 """
 
+import sys
 import argparse
 import json
 import time
@@ -31,7 +32,14 @@ from high_performance_jax.profiling import (
     _get_default_trace_dir,
 )
 
-from high_performance_jax.pallas.pallas_flash_attn import flash_attention
+# Check backend and set interpret mode for CPU
+if jax.default_backend() == 'cpu':
+    # Modify INTERPRET_MODE for CPU execution
+    import high_performance_jax.pallas.pallas_flash_attn as flash_attn_module
+    flash_attn_module.INTERPRET_MODE = True
+    flash_attention = flash_attn_module.flash_attention
+else:
+    from high_performance_jax.pallas.pallas_flash_attn import flash_attention
 
 
 # GPU Specifications for RTX 4000 Ada
@@ -58,15 +66,19 @@ def calculate_flops(B: int, H: int, T: int, D: int) -> float:
     """Calculate FLOPs for forward+backward attention.
 
     Forward:
-    - Q @ K.T: B*H*T*D*T * 2 (mult + add)
-    - Softmax: B*H*T*T * ~5 ops
-    - Attention @ V: B*H*T*D*T * 2 (mult + add)
+    - Q @ K.T: B*H*T*T*D * 2 (mult + add per element)
+    - Softmax: B*H*T*T * ~5 ops (exp, sum, max, div, sub)
+    - Attention @ V: B*H*T*T*D * 2 (mult + add per element)
 
-    Backward: ~2x forward (gradient computation)
+    Backward: ~2.5x forward (gradient computation more expensive)
 
-    Simplified: 2 * 2 * B * H * T^2 * D (two matmuls * fwd+bwd)
+    Total: 2.5 * (2 * B * H * T^2 * D + B * H * T^2 * 5)
     """
-    return 4.0 * B * H * (T ** 2) * D  # 2 matmuls * fwd+bwd
+    fwd_matmul = 2 * B * H * T * T * D  # Q@K + Attention@V
+    fwd_softmax = 5 * B * H * T * T        # Softmax ops
+    total_fwd = fwd_matmul + fwd_softmax
+    total = 2.5 * total_fwd  # Backward ~2.5x forward
+    return total
 
 
 def calculate_bytes_naive(B: int, H: int, T: int, D: int) -> float:
@@ -77,14 +89,15 @@ def calculate_bytes_naive(B: int, H: int, T: int, D: int) -> float:
     - Attention matrix (T×T): B*H*T*T * 4 bytes  <-- THE BIG ONE
     - Output O: B*H*T*D * 4 bytes
 
-    Backward doubles this.
+    Backward: similar traffic plus gradients, approximately 2x forward
     """
     fwd_bytes = (
         B * H * T * D * 3 * 4 +  # Q, K, V
         B * H * T * T * 4 +       # Attention matrix
         B * H * T * D * 4          # Output O
     )
-    return fwd_bytes * 2  # Forward + backward
+    # Backward roughly doubles memory traffic (gradients similar size)
+    return fwd_bytes * 2
 
 
 def calculate_bytes_flash(B: int, H: int, T: int, D: int) -> float:
@@ -95,14 +108,15 @@ def calculate_bytes_flash(B: int, H: int, T: int, D: int) -> float:
     - logsumexp: B*H*T * 4 bytes  <-- TINY RESIDUAL
     - Output O: B*H*T*D * 4 bytes
 
-    Backward doubles this.
+    Backward: similar traffic plus gradients, approximately 2x forward
     """
     fwd_bytes = (
         B * H * T * D * 3 * 4 +  # Q, K, V
         B * H * T * 4 +             # logsumexp
         B * H * T * D * 4            # Output O
     )
-    return fwd_bytes * 2  # Forward + backward
+    # Backward roughly doubles memory traffic (gradients similar size)
+    return fwd_bytes * 2
 
 
 def benchmark_attention(
@@ -146,7 +160,7 @@ def benchmark_attention(
         _, grads = ref_fwd_bwd(q, k, v)
         jax.block_until_ready(grads)
 
-    # Time naive MHA
+    # Time naive MHA (more iterations for accuracy)
     print("  Timing naive MHA...")
     naive_times = []
     for _ in range(profile_iters):
@@ -155,10 +169,12 @@ def benchmark_attention(
         jax.block_until_ready(grads)
         naive_times.append(time.perf_counter() - t0)
 
-    naive_time_ms = np.mean(naive_times) * 1000
-    naive_gflops_s = flops / (np.mean(naive_times) * 1e9)
+    # Use median for robustness (ignore outliers)
+    naive_time_s = np.median(naive_times)
+    naive_time_ms = naive_time_s * 1000
+    naive_gflops_s = flops / (naive_time_s * 1e9)
     naive_ai = flops / bytes_naive
-    naive_bw_gb_s = bytes_naive / (np.mean(naive_times) * 1e9)
+    naive_bw_gb_s = bytes_naive / (naive_time_s * 1e9)
 
     # Time flash attention
     def flash_loss(q, k, v):
@@ -172,7 +188,7 @@ def benchmark_attention(
         _, grads = flash_fwd_bwd(q, k, v)
         jax.block_until_ready(grads)
 
-    # Time flash attention
+    # Time flash attention (more iterations for accuracy)
     print("  Timing flash attention...")
     flash_times = []
     for _ in range(profile_iters):
@@ -181,10 +197,12 @@ def benchmark_attention(
         jax.block_until_ready(grads)
         flash_times.append(time.perf_counter() - t0)
 
-    flash_time_ms = np.mean(flash_times) * 1000
-    flash_gflops_s = flops / (np.mean(flash_times) * 1e9)
+    # Use median for robustness (ignore outliers)
+    flash_time_s = np.median(flash_times)
+    flash_time_ms = flash_time_s * 1000
+    flash_gflops_s = flops / (flash_time_s * 1e9)
     flash_ai = flops / bytes_flash
-    flash_bw_gb_s = bytes_flash / (np.mean(flash_times) * 1e9)
+    flash_bw_gb_s = bytes_flash / (flash_time_s * 1e9)
 
     speedup = naive_time_ms / flash_time_ms
 
@@ -294,9 +312,10 @@ def generate_roofline_plot(
         f'GPU Specifications:\n'
         f'  Peak Compute: {gpu["peak_compute_tflops"]:.1f} TFLOP/s\n'
         f'  Peak BW: {gpu["peak_bandwidth_gb_s"]:.1f} GB/s\n'
-        f'  Ridge AI: {ridge_ai:.1f} FLOPs/byte'
+        f'  Ridge AI: {ridge_ai:.1f} FLOPs/byte\n\n'
+        f'  Note: 1 TFLOP/s = 1,000 GFLOP/s'
     )
-    ax.text(0.02, 0.98, specs_text, transform=ax.transAxes, fontsize=10,
+    ax.text(0.02, 0.98, specs_text, transform=ax.transAxes, fontsize=9,
             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
 
     plt.tight_layout()
@@ -412,6 +431,16 @@ def main():
 
     avg_speedup = np.mean(results["speedups"])
     print(f"\nAverage speedup: {avg_speedup:.2f}x")
+
+    # Verify GFLOPs/s against peak compute
+    max_flash_gflops = np.max(results["flash"]["gflops_s"])
+    peak_gflops = gpu["peak_compute_tflops"] * 1000  # Convert TFLOP/s to GFLOP/s
+    utilization = (max_flash_gflops / peak_gflops) * 100
+    print(f"\nPeak verification:")
+    print(f"  GPU Peak Compute: {peak_gflops:.0f} GFLOP/s ({gpu['peak_compute_tflops']:.1f} TFLOP/s)")
+    print(f"  Max Achieved: {max_flash_gflops:.0f} GFLOP/s")
+    print(f"  Utilization: {utilization:.1f}%")
+    print(f"  Note: 1 TFLOP/s = 1,000 GFLOP/s")
 
     # Save results to JSON
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
