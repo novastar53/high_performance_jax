@@ -18,18 +18,26 @@ Usage:
     # Start xprof server for viewing
     start_xprof_server()  # Then SSH tunnel: ssh -L 8791:localhost:8791 user@host
 
-Remote profiling setup:
+Remote profiling setup (Option 1 - SSH tunnel):
     1. Run your script with profiling on the remote machine
     2. Start xprof server: python -c "from high_performance_jax.profiling import start_xprof_server; start_xprof_server()"
     3. SSH tunnel: ssh -L 8791:localhost:8791 user@remote_host
     4. Open http://localhost:8791 in your browser
+
+Local profiling setup (Option 2 - Download traces):
+    1. Run profiling script on remote GPU: python scripts/profile_attention.py
+    2. Download traces to local: make download-traces h=<host> k=<keyfile>
+    3. View locally: make xprof-serve
+
+Traces are saved to: <repo>/traces/{YYYY-MM-DD}/{name}/
 """
 
 import os
 import subprocess
 import sys
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Any
 
@@ -37,19 +45,36 @@ import jax
 import jax.numpy as jnp
 
 
-# Default trace directory
-DEFAULT_TRACE_DIR = Path("/tmp/jax-traces")
+def _find_repo_root() -> Path:
+    """Find the repository root by looking for .git directory."""
+    current = Path(__file__).resolve()
+    for parent in [current] + list(current.parents):
+        if (parent / ".git").exists():
+            return parent
+    # Fallback to current working directory
+    return Path.cwd()
+
+
+def _get_default_trace_dir() -> Path:
+    """Get the default trace directory within the repository."""
+    repo_root = _find_repo_root()
+    return repo_root / "traces"
+
+
+# Default trace directory (within repo)
+DEFAULT_TRACE_DIR = _get_default_trace_dir()
 
 
 @dataclass
 class ProfileConfig:
     """Configuration for profiling."""
-    trace_dir: Path = DEFAULT_TRACE_DIR
+    trace_dir: Path = field(default_factory=_get_default_trace_dir)
     host_tracer_level: int = 2  # 0=disabled, 1=user events, 2=default, 3=verbose
     device_tracer_level: int = 1  # 0=disabled, 1=enabled
     python_tracer_level: int = 0  # 0=disabled, 1=enabled
     warmup_iters: int = 3
     profile_iters: int = 1
+    organize_by_date: bool = True  # Organize traces by date
 
     def __post_init__(self):
         self.trace_dir = Path(self.trace_dir)
@@ -66,6 +91,7 @@ def configure(
     python_tracer_level: int | None = None,
     warmup_iters: int | None = None,
     profile_iters: int | None = None,
+    organize_by_date: bool | None = None,
 ):
     """Configure global profiling settings."""
     global _config
@@ -81,12 +107,31 @@ def configure(
         _config.warmup_iters = warmup_iters
     if profile_iters is not None:
         _config.profile_iters = profile_iters
+    if organize_by_date is not None:
+        _config.organize_by_date = organize_by_date
+
+
+def get_trace_dir() -> Path:
+    """Get the current trace directory."""
+    return _config.trace_dir
 
 
 def _get_trace_path(name: str) -> Path:
-    """Get the trace path for a given profile name."""
-    _config.trace_dir.mkdir(parents=True, exist_ok=True)
-    return _config.trace_dir / name
+    """Get the trace path for a given profile name.
+
+    If organize_by_date is True, traces are saved to:
+        <trace_dir>/<YYYY-MM-DD>/<name>/
+    Otherwise:
+        <trace_dir>/<name>/
+    """
+    if _config.organize_by_date:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        base_dir = _config.trace_dir / date_str
+    else:
+        base_dir = _config.trace_dir
+
+    base_dir.mkdir(parents=True, exist_ok=True)
+    return base_dir / name
 
 
 def _make_profiler_options() -> jax.profiler.ProfileOptions:
@@ -279,23 +324,61 @@ def start_xprof_server(port: int = 8791, trace_dir: str | Path | None = None, bl
         return subprocess.Popen(cmd)
 
 
-def list_traces() -> list[Path]:
-    """List all available traces."""
-    if not _config.trace_dir.exists():
+def list_traces(trace_dir: Path | None = None) -> list[Path]:
+    """List all available traces, organized by date."""
+    base_dir = trace_dir or _config.trace_dir
+    if not base_dir.exists():
         return []
-    return sorted(_config.trace_dir.iterdir())
+
+    traces = []
+    for item in sorted(base_dir.iterdir()):
+        if item.is_dir():
+            # Check if it's a date directory (YYYY-MM-DD format)
+            if len(item.name) == 10 and item.name[4] == '-' and item.name[7] == '-':
+                # It's a date directory, list subdirectories
+                for trace in sorted(item.iterdir()):
+                    if trace.is_dir():
+                        traces.append(trace)
+            else:
+                # It's a trace directory directly
+                traces.append(item)
+    return traces
 
 
-def print_traces():
+def print_traces(trace_dir: Path | None = None):
     """Print all available traces with xprof commands."""
-    traces = list_traces()
+    traces = list_traces(trace_dir)
+    base_dir = trace_dir or _config.trace_dir
+
     if not traces:
-        print(f"No traces found in {_config.trace_dir}")
+        print(f"No traces found in {base_dir}")
         return
 
-    print(f"Available traces in {_config.trace_dir}:")
+    print(f"Available traces in {base_dir}:\n")
+
+    current_date = None
     for trace in traces:
-        print(f"  xprof --port 8791 {trace}")
+        # Check if parent is a date directory
+        parent_name = trace.parent.name
+        if len(parent_name) == 10 and parent_name[4] == '-':
+            if parent_name != current_date:
+                current_date = parent_name
+                print(f"  {current_date}/")
+            print(f"    {trace.name}")
+        else:
+            print(f"  {trace.name}")
+
+    print(f"\nView with: xprof --port 8791 <trace_path>")
+    print(f"Or run: make xprof-serve")
+
+
+def get_latest_trace() -> Path | None:
+    """Get the most recently created trace."""
+    traces = list_traces()
+    if not traces:
+        return None
+    # Return the last one (sorted by date/name)
+    return traces[-1]
 
 
 # Convenience function for quick profiling
@@ -317,21 +400,23 @@ if __name__ == "__main__":
     # xprof server command
     server_parser = subparsers.add_parser("serve", help="Start xprof server")
     server_parser.add_argument("--port", type=int, default=8791, help="Port to serve on")
-    server_parser.add_argument("--trace-dir", type=str, default=str(DEFAULT_TRACE_DIR),
-                               help="Directory containing traces")
+    server_parser.add_argument("--trace-dir", type=str, default=None,
+                               help="Directory containing traces (default: repo/traces)")
 
     # list traces command
     list_parser = subparsers.add_parser("list", help="List available traces")
-    list_parser.add_argument("--trace-dir", type=str, default=str(DEFAULT_TRACE_DIR),
-                            help="Directory containing traces")
+    list_parser.add_argument("--trace-dir", type=str, default=None,
+                            help="Directory containing traces (default: repo/traces)")
 
     args = parser.parse_args()
 
     if args.command == "serve":
-        configure(trace_dir=args.trace_dir)
+        if args.trace_dir:
+            configure(trace_dir=args.trace_dir)
         start_xprof_server(port=args.port)
     elif args.command == "list":
-        configure(trace_dir=args.trace_dir)
+        if args.trace_dir:
+            configure(trace_dir=args.trace_dir)
         print_traces()
     else:
         parser.print_help()
