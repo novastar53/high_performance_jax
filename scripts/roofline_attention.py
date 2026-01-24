@@ -130,6 +130,16 @@ def calculate_bytes_flash(B: int, H: int, T: int, D: int, bytes_per_elem: int = 
     return fwd_bytes * 2
 
 
+def cudnn_attention(q, k, v):
+    """JAX cuDNN attention - expects (B, H, T, D), uses cuDNN flash attention."""
+    # Transpose from (B, H, T, D) to (B, T, H, D) for jax.nn.dot_product_attention
+    q_t = jnp.transpose(q, (0, 2, 1, 3))
+    k_t = jnp.transpose(k, (0, 2, 1, 3))
+    v_t = jnp.transpose(v, (0, 2, 1, 3))
+    out = jax.nn.dot_product_attention(q_t, k_t, v_t, implementation='cudnn')
+    return jnp.transpose(out, (0, 2, 1, 3))  # Back to (B, H, T, D)
+
+
 def benchmark_attention(
     B: int, H: int, T: int, D: int,
     dtype=jnp.float16,
@@ -139,7 +149,7 @@ def benchmark_attention(
     """Benchmark a single configuration.
 
     Returns:
-        Dict with 'naive' and 'flash' results containing:
+        Dict with 'naive', 'flash', and 'cudnn' results containing:
         - time_ms: average execution time
         - gflops_s: achieved GFLOPs/s
         - ai: arithmetic intensity (FLOPs/byte)
@@ -188,7 +198,7 @@ def benchmark_attention(
     naive_ai = flops / bytes_naive
     naive_bw_gb_s = bytes_naive / (naive_time_s * 1e9)
 
-    # Time flash attention
+    # Time flash attention (our Pallas implementation)
     def flash_loss(q, k, v):
         return jnp.sum(flash_attention(q, k, v) * do)
 
@@ -216,11 +226,41 @@ def benchmark_attention(
     flash_ai = flops / bytes_flash
     flash_bw_gb_s = bytes_flash / (flash_time_s * 1e9)
 
-    speedup = naive_time_ms / flash_time_ms
+    # Time cuDNN attention (jax.nn.dot_product_attention)
+    def cudnn_loss(q, k, v):
+        return jnp.sum(cudnn_attention(q, k, v) * do)
+
+    cudnn_fwd_bwd = jax.jit(jax.value_and_grad(cudnn_loss, argnums=(0, 1, 2)))
+
+    # Warm up cuDNN attention
+    print("  Warming up cuDNN attention...")
+    for _ in range(warmup_iters):
+        _, grads = cudnn_fwd_bwd(q, k, v)
+        jax.block_until_ready(grads)
+
+    # Time cuDNN attention
+    print("  Timing cuDNN attention...")
+    cudnn_times = []
+    for _ in range(profile_iters):
+        t0 = time.perf_counter()
+        _, grads = cudnn_fwd_bwd(q, k, v)
+        jax.block_until_ready(grads)
+        cudnn_times.append(time.perf_counter() - t0)
+
+    cudnn_time_s = np.median(cudnn_times)
+    cudnn_time_ms = cudnn_time_s * 1000
+    cudnn_gflops_s = flops / (cudnn_time_s * 1e9)
+    cudnn_ai = flops / bytes_flash  # cuDNN uses flash attention, same memory pattern
+    cudnn_bw_gb_s = bytes_flash / (cudnn_time_s * 1e9)
+
+    speedup_flash = naive_time_ms / flash_time_ms
+    speedup_cudnn = naive_time_ms / cudnn_time_ms
 
     print(f"  Naive:  {naive_time_ms:.3f} ms, {naive_gflops_s:.2f} GFLOP/s, AI={naive_ai:.1f}")
-    print(f"  Flash:   {flash_time_ms:.3f} ms, {flash_gflops_s:.2f} GFLOP/s, AI={flash_ai:.1f}")
-    print(f"  Speedup: {speedup:.2f}x")
+    print(f"  Flash:  {flash_time_ms:.3f} ms, {flash_gflops_s:.2f} GFLOP/s, AI={flash_ai:.1f}")
+    print(f"  cuDNN:  {cudnn_time_ms:.3f} ms, {cudnn_gflops_s:.2f} GFLOP/s, AI={cudnn_ai:.1f}")
+    print(f"  Speedup (flash vs naive): {speedup_flash:.2f}x")
+    print(f"  Speedup (cuDNN vs naive): {speedup_cudnn:.2f}x")
 
     return {
         "naive": {
@@ -235,7 +275,14 @@ def benchmark_attention(
             "ai": flash_ai,
             "bw_gb_s": flash_bw_gb_s,
         },
-        "speedup": speedup,
+        "cudnn": {
+            "time_ms": cudnn_time_ms,
+            "gflops_s": cudnn_gflops_s,
+            "ai": cudnn_ai,
+            "bw_gb_s": cudnn_bw_gb_s,
+        },
+        "speedup": speedup_flash,
+        "speedup_cudnn": speedup_cudnn,
     }
 
 
@@ -247,7 +294,7 @@ def generate_roofline_plot(
     """Generate roofline plot.
 
     Args:
-        results: Dict with 'sequence_lengths', 'naive', 'flash' data
+        results: Dict with 'sequence_lengths', 'naive', 'flash', 'cudnn' data
         gpu_key: Key for GPU specs in GPU_SPECS
         output_path: Path to save PNG plot
     """
@@ -256,15 +303,17 @@ def generate_roofline_plot(
     seq_lengths = np.array(results["sequence_lengths"])
     naive_ai = np.array(results["naive"]["ai"])
     flash_ai = np.array(results["flash"]["ai"])
+    cudnn_ai = np.array(results["cudnn"]["ai"])
     naive_perf = np.array(results["naive"]["gflops_s"])
     flash_perf = np.array(results["flash"]["gflops_s"])
+    cudnn_perf = np.array(results["cudnn"]["gflops_s"])
 
     # Create figure
     fig, ax = plt.subplots(figsize=(12, 8))
 
     # Determine axis range based on actual data
-    all_ai = np.concatenate([naive_ai, flash_ai])
-    all_perf = np.concatenate([naive_perf, flash_perf])
+    all_ai = np.concatenate([naive_ai, flash_ai, cudnn_ai])
+    all_perf = np.concatenate([naive_perf, flash_perf, cudnn_perf])
     ai_min = min(all_ai.min(), gpu['ridge_ai']) / 2  # Include ridge point, with padding
     ai_max = max(all_ai.max(), gpu['ridge_ai']) * 2
 
@@ -290,17 +339,26 @@ def generate_roofline_plot(
     ax.scatter(naive_ai, naive_perf, marker='o', s=150, c='red',
                edgecolors='black', linewidth=1.5, label='Naive MHA', zorder=5)
     ax.scatter(flash_ai, flash_perf, marker='s', s=150, c='blue',
-               edgecolors='black', linewidth=1.5, label='Flash Attention', zorder=5)
+               edgecolors='black', linewidth=1.5, label='Flash (Pallas)', zorder=5)
+    ax.scatter(cudnn_ai, cudnn_perf, marker='^', s=150, c='green',
+               edgecolors='black', linewidth=1.5, label='cuDNN Flash', zorder=5)
 
-    # Annotate sequence lengths
+    # Annotate sequence lengths (only for largest/smallest to avoid clutter)
     for i, (ai, perf, T) in enumerate(zip(naive_ai, naive_perf, seq_lengths)):
-        ax.annotate(f'T={T}', (ai, perf), fontsize=8,
-                    xytext=(0, 10), textcoords='offset points',
-                    ha='center', va='bottom')
+        if i == 0 or i == len(seq_lengths) - 1:
+            ax.annotate(f'T={T}', (ai, perf), fontsize=8,
+                        xytext=(0, 10), textcoords='offset points',
+                        ha='center', va='bottom')
     for i, (ai, perf, T) in enumerate(zip(flash_ai, flash_perf, seq_lengths)):
-        ax.annotate(f'T={T}', (ai, perf), fontsize=8,
-                    xytext=(0, 10), textcoords='offset points',
-                    ha='center', va='bottom')
+        if i == 0 or i == len(seq_lengths) - 1:
+            ax.annotate(f'T={T}', (ai, perf), fontsize=8,
+                        xytext=(0, -15), textcoords='offset points',
+                        ha='center', va='top')
+    for i, (ai, perf, T) in enumerate(zip(cudnn_ai, cudnn_perf, seq_lengths)):
+        if i == 0 or i == len(seq_lengths) - 1:
+            ax.annotate(f'T={T}', (ai, perf), fontsize=8,
+                        xytext=(10, 0), textcoords='offset points',
+                        ha='left', va='center')
 
     # Ridge point annotation
     ridge_perf = gpu["peak_compute_tflops"] * 1000  # Convert TFLOP/s to GFLOP/s
@@ -330,7 +388,7 @@ def generate_roofline_plot(
     perf_max = max(all_perf.max(), ridge_perf) * 1.5
     ax.set_ylim(perf_min, perf_max)
 
-    ax.set_title(f'Roofline Analysis: Naive MHA vs Flash Attention\n{gpu["name"]}',
+    ax.set_title(f'Roofline Analysis: Naive vs Flash (Pallas) vs cuDNN\n{gpu["name"]}',
                  fontsize=14, fontweight='bold')
     ax.grid(True, alpha=0.3)
     ax.legend(loc='lower right', fontsize=11)
@@ -436,7 +494,9 @@ def main():
         "sequence_lengths": seq_lengths,
         "naive": {"time_ms": [], "gflops_s": [], "ai": [], "bw_gb_s": []},
         "flash": {"time_ms": [], "gflops_s": [], "ai": [], "bw_gb_s": []},
+        "cudnn": {"time_ms": [], "gflops_s": [], "ai": [], "bw_gb_s": []},
         "speedups": [],
+        "speedups_cudnn": [],
     }
 
     for T in seq_lengths:
@@ -455,39 +515,51 @@ def main():
         results["flash"]["ai"].append(benchmark_result["flash"]["ai"])
         results["flash"]["bw_gb_s"].append(benchmark_result["flash"]["bw_gb_s"])
 
+        results["cudnn"]["time_ms"].append(benchmark_result["cudnn"]["time_ms"])
+        results["cudnn"]["gflops_s"].append(benchmark_result["cudnn"]["gflops_s"])
+        results["cudnn"]["ai"].append(benchmark_result["cudnn"]["ai"])
+        results["cudnn"]["bw_gb_s"].append(benchmark_result["cudnn"]["bw_gb_s"])
+
         results["speedups"].append(benchmark_result["speedup"])
+        results["speedups_cudnn"].append(benchmark_result["speedup_cudnn"])
 
     # Print summary table
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 95)
     print("SUMMARY TABLE")
-    print("=" * 70)
-    print(f"{'T':<6} {'Naive':<12} {'Flash':<12} {'Naive':<12} {'Flash':<12} {'Naive':<10} {'Flash':<10} {'Speedup':<8}")
-    print(f"{'':<6} {'(ms)':<12} {'(ms)':<12} {'(GFLOP/s)':<12} {'(GFLOP/s)':<12} {'(AI)':<10} {'(AI)':<10} {'':<8}")
-    print("-" * 70)
+    print("=" * 95)
+    print(f"{'T':<6} {'Naive':<10} {'Flash':<10} {'cuDNN':<10} "
+          f"{'Naive':<12} {'Flash':<12} {'cuDNN':<12} {'Flash':<8} {'cuDNN':<8}")
+    print(f"{'':<6} {'(ms)':<10} {'(ms)':<10} {'(ms)':<10} "
+          f"{'(GFLOP/s)':<12} {'(GFLOP/s)':<12} {'(GFLOP/s)':<12} {'Speedup':<8} {'Speedup':<8}")
+    print("-" * 95)
 
     for i, T in enumerate(seq_lengths):
-        print(f"{T:<6} {results['naive']['time_ms'][i]:<12.3f} "
-              f"{results['flash']['time_ms'][i]:<12.3f} "
+        print(f"{T:<6} {results['naive']['time_ms'][i]:<10.3f} "
+              f"{results['flash']['time_ms'][i]:<10.3f} "
+              f"{results['cudnn']['time_ms'][i]:<10.3f} "
               f"{results['naive']['gflops_s'][i]:<12.2f} "
               f"{results['flash']['gflops_s'][i]:<12.2f} "
-              f"{results['naive']['ai'][i]:<10.1f} "
-              f"{results['flash']['ai'][i]:<10.1f} "
-              f"{results['speedups'][i]:<8.2f}x")
+              f"{results['cudnn']['gflops_s'][i]:<12.2f} "
+              f"{results['speedups'][i]:<8.2f}x "
+              f"{results['speedups_cudnn'][i]:<8.2f}x")
 
     avg_speedup = np.mean(results["speedups"])
-    print(f"\nAverage speedup: {avg_speedup:.2f}x")
+    avg_speedup_cudnn = np.mean(results["speedups_cudnn"])
+    print(f"\nAverage speedup (flash vs naive):  {avg_speedup:.2f}x")
+    print(f"Average speedup (cuDNN vs naive):  {avg_speedup_cudnn:.2f}x")
 
     # Verify GFLOPs/s against peak compute
     max_flash_gflops = np.max(results["flash"]["gflops_s"])
+    max_cudnn_gflops = np.max(results["cudnn"]["gflops_s"])
     peak_gflops = gpu["peak_compute_tflops"] * 1000  # Convert TFLOP/s to GFLOP/s
-    utilization = (max_flash_gflops / peak_gflops) * 100
+    utilization_flash = (max_flash_gflops / peak_gflops) * 100
+    utilization_cudnn = (max_cudnn_gflops / peak_gflops) * 100
     print(f"\nPeak verification:")
     print(f"  GPU Peak Compute: {peak_gflops:.0f} GFLOP/s ({gpu['peak_compute_tflops']:.1f} TFLOP/s)")
-    print(f"  Max Achieved: {max_flash_gflops:.0f} GFLOP/s")
-    print(f"  Utilization: {utilization:.1f}%")
-    print(f"  Note: 1 TFLOP/s = 1,000 GFLOP/s")
-    print(f"\n  FLOPs per op: 4 matmul, 5 softmax, ~2x for backward")
-    print(f"  Backward FLOP estimation is approximate - actual ops vary by implementation")
+    print(f"  Max Achieved (flash): {max_flash_gflops:.0f} GFLOP/s ({utilization_flash:.1f}%)")
+    print(f"  Max Achieved (cuDNN): {max_cudnn_gflops:.0f} GFLOP/s ({utilization_cudnn:.1f}%)")
+    print(f"\n  FLOPs: fwd ~4*T^2*D, bwd ~14*T^2*D (flash recomputes attention twice)")
+    print(f"  Note: cuDNN backward may use different algorithm with different FLOP count")
 
     # Save results to JSON
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
