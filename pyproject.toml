@@ -19,6 +19,7 @@ dependencies = [
     "deepkit>=1.0.9",
     "flax>=0.12.2",
     "xprof>=0.0.8",
+    "matplotlib>=3.10.8",
 ]
 
 [project.optional-dependencies]

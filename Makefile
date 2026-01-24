@@ -184,7 +184,7 @@ lab:
 
 # Generate roofline plot for attention (usage: make roofline [batch=4] [heads=8] [head-dim=64] [seq-lengths=128,256,512,1024,2048,4096])
 roofline:
-	uv run python scripts/roofline_attention.py --batch $(batch) --heads $(heads) --head-dim $(head-dim) --seq-lengths "$(seq-lengths)"
+	uv run python scripts/roofline_attention.py 
 
 # Help command
 help:
