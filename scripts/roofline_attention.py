@@ -87,39 +87,39 @@ def calculate_flops(B: int, H: int, T: int, D: int) -> float:
     return total
 
 
-def calculate_bytes_naive(B: int, H: int, T: int, D: int) -> float:
+def calculate_bytes_naive(B: int, H: int, T: int, D: int, bytes_per_elem: int = 4) -> float:
     """Calculate bytes transferred for naive MHA (fwd+bwd).
 
     Naive MHA materializes full attention matrix:
-    - Q, K, V (input): B*H*T*D * 3 * 4 bytes
-    - Attention matrix (T×T): B*H*T*T * 4 bytes  <-- THE BIG ONE
-    - Output O: B*H*T*D * 4 bytes
+    - Q, K, V (input): B*H*T*D * 3 * bytes_per_elem
+    - Attention matrix (T×T): B*H*T*T * bytes_per_elem  <-- THE BIG ONE
+    - Output O: B*H*T*D * bytes_per_elem
 
     Backward: similar traffic plus gradients, approximately 2x forward
     """
     fwd_bytes = (
-        B * H * T * D * 3 * 4 +  # Q, K, V
-        B * H * T * T * 4 +       # Attention matrix
-        B * H * T * D * 4          # Output O
+        B * H * T * D * 3 * bytes_per_elem +  # Q, K, V
+        B * H * T * T * bytes_per_elem +       # Attention matrix
+        B * H * T * D * bytes_per_elem          # Output O
     )
     # Backward roughly doubles memory traffic (gradients similar size)
     return fwd_bytes * 2
 
 
-def calculate_bytes_flash(B: int, H: int, T: int, D: int) -> float:
+def calculate_bytes_flash(B: int, H: int, T: int, D: int, bytes_per_elem: int = 4) -> float:
     """Calculate bytes transferred for flash attention (fwd+bwd).
 
     Flash attention computes in tiles, only stores logsumexp:
-    - Q, K, V (input): B*H*T*D * 3 * 4 bytes
-    - logsumexp: B*H*T * 4 bytes  <-- TINY RESIDUAL
-    - Output O: B*H*T*D * 4 bytes
+    - Q, K, V (input): B*H*T*D * 3 * bytes_per_elem
+    - logsumexp: B*H*T * bytes_per_elem  <-- TINY RESIDUAL
+    - Output O: B*H*T*D * bytes_per_elem
 
     Backward: similar traffic plus gradients, approximately 2x forward
     """
     fwd_bytes = (
-        B * H * T * D * 3 * 4 +  # Q, K, V
-        B * H * T * 4 +             # logsumexp
-        B * H * T * D * 4            # Output O
+        B * H * T * D * 3 * bytes_per_elem +  # Q, K, V
+        B * H * T * bytes_per_elem +             # logsumexp
+        B * H * T * D * bytes_per_elem            # Output O
     )
     # Backward roughly doubles memory traffic (gradients similar size)
     return fwd_bytes * 2
@@ -150,9 +150,10 @@ def benchmark_attention(
     do = jax.random.normal(keys[3], (B, H, T, D), dtype=dtype)
 
     # Calculate FLOPs and bytes for this configuration
+    bytes_per_elem = 2 if dtype == jnp.float16 else 4
     flops = calculate_flops(B, H, T, D)
-    bytes_naive = calculate_bytes_naive(B, H, T, D)
-    bytes_flash = calculate_bytes_flash(B, H, T, D)
+    bytes_naive = calculate_bytes_naive(B, H, T, D, bytes_per_elem)
+    bytes_flash = calculate_bytes_flash(B, H, T, D, bytes_per_elem)
 
     # Time naive MHA
     def ref_loss(q, k, v):
@@ -256,11 +257,18 @@ def generate_roofline_plot(
     # Create figure
     fig, ax = plt.subplots(figsize=(12, 8))
 
+    # Determine axis range based on actual data
+    all_ai = np.concatenate([naive_ai, flash_ai])
+    all_perf = np.concatenate([naive_perf, flash_perf])
+    ai_min = min(all_ai.min(), gpu['ridge_ai']) / 2  # Include ridge point, with padding
+    ai_max = max(all_ai.max(), gpu['ridge_ai']) * 2
+
     # Roofline calculations
-    ai_range = np.logspace(0.5, 4, 100)  # 3.16 to 10000 FLOPs/byte
+    ai_range = np.logspace(np.log10(ai_min), np.log10(ai_max), 100)
 
     # Memory roof (diagonal)
-    memory_roof = gpu["peak_bandwidth_gb_s"] * ai_range / 1000.0  # GB/s -> GFLOP/s
+    # GB/s * FLOPs/byte = 10^9 bytes/s * FLOPs/byte = 10^9 FLOPs/s = GFLOP/s
+    memory_roof = gpu["peak_bandwidth_gb_s"] * ai_range
 
     # Compute roof (horizontal)
     compute_roof = gpu["peak_compute_tflops"] * 1000 * np.ones_like(ai_range)  # TFLOP/s -> GFLOP/s
@@ -290,19 +298,19 @@ def generate_roofline_plot(
                     ha='center', va='bottom')
 
     # Ridge point annotation
-    ridge_perf = gpu["peak_compute_tflops"]
-    ridge_ai_str = f"{gpu['ridge_ai']:.1f}"
-    ax.axvline(ridge_ai_str, color='gray', linestyle=':', alpha=0.5)
-    ax.text(ridge_ai_str, ridge_perf * 0.1, f'  Ridge\n  AI={ridge_ai_str}',
+    ridge_perf = gpu["peak_compute_tflops"] * 1000  # Convert TFLOP/s to GFLOP/s
+    ridge_ai = gpu['ridge_ai']
+    ax.axvline(ridge_ai, color='gray', linestyle=':', alpha=0.5)
+    ax.text(ridge_ai, ridge_perf * 0.1, f'  Ridge\n  AI={ridge_ai:.1f}',
             fontsize=10, rotation=90, va='bottom', ha='right')
 
-    # Region annotations
-    ax.text(ai_range[0] * 2, ridge_perf * 1.2, 'Memory-Bound\n(AI < Ridge)',
-            fontsize=11, ha='left', va='top',
+    # Region annotations - position relative to ridge point
+    ax.text(ridge_ai / 3, ridge_perf * 1.2, 'Memory-Bound\n(AI < Ridge)',
+            fontsize=11, ha='center', va='top',
             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
 
-    ax.text(ai_range[-1] * 0.4, ridge_perf * 1.2, 'Compute-Bound\n(AI > Ridge)',
-            fontsize=11, ha='right', va='top',
+    ax.text(ridge_ai * 3, ridge_perf * 1.2, 'Compute-Bound\n(AI > Ridge)',
+            fontsize=11, ha='center', va='top',
             bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
 
     # Labels and styling
@@ -310,6 +318,13 @@ def generate_roofline_plot(
     ax.set_ylabel('Performance (GFLOP/s)', fontsize=12, fontweight='bold')
     ax.set_xscale('log')
     ax.set_yscale('log')
+
+    # Set axis limits based on data range
+    ax.set_xlim(ai_min, ai_max)
+    perf_min = all_perf.min() / 2
+    perf_max = max(all_perf.max(), ridge_perf) * 1.5
+    ax.set_ylim(perf_min, perf_max)
+
     ax.set_title(f'Roofline Analysis: Naive MHA vs Flash Attention\n{gpu["name"]}',
                  fontsize=14, fontweight='bold')
     ax.grid(True, alpha=0.3)
