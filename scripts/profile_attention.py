@@ -137,7 +137,6 @@ def main():
     parser.add_argument("--heads", type=int, default=8, help="Number of attention heads")
     parser.add_argument("--seq-len", type=int, default=1024, help="Sequence length")
     parser.add_argument("--head-dim", type=int, default=64, help="Head dimension")
-    parser.add_argument("--backward", action="store_true", help="Also profile backward pass")
     parser.add_argument("--scaling", action="store_true",
                        help="Profile memory scaling across sequence lengths")
 
@@ -166,9 +165,8 @@ def main():
         # Profile forward pass
         profile_forward_pass(args.batch, args.heads, args.seq_len, args.head_dim)
 
-        # Optionally profile backward pass
-        if args.backward:
-            profile_backward_pass(args.batch, args.heads, args.seq_len, args.head_dim)
+        # Profile backward pass
+        profile_backward_pass(args.batch, args.heads, args.seq_len, args.head_dim)
 
     print("\n" + "="*60)
     print("Profiling complete!")
