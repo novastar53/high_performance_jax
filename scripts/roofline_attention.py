@@ -43,12 +43,27 @@ else:
 
 
 # GPU Specifications for RTX 4000 Ada
+# From NVIDIA datasheet:
+# - FP32 CUDA cores: 26.7 TFLOP/s
+# - FP16 CUDA cores: 26.7 TFLOP/s (1:1 with FP32)
+# - Tensor Performance: 327.6 TFLOP/s (INT8/sparse modes)
+# - Memory Bandwidth: 360 GB/s
+#
+# Observed performance:
+# - Pallas flash attention: ~27 TFLOP/s
+#   (Should use tensor cores via Triton, but achieves CUDA-core level perf.
+#    Likely due to suboptimal block sizes, memory patterns, or loop overhead.)
+# - cuDNN flash attention: ~55 TFLOP/s
+#   (Highly optimized, achieves full tensor core throughput)
 GPU_SPECS = {
     "rtx4000-ada": {
         "name": "NVIDIA RTX 4000 Ada",
-        "peak_compute_tflops": 26.7,  # FP16 with tensor cores
-        "peak_bandwidth_gb_s": 360.0,  # GDDR6
-        "ridge_ai": 26.7e3 / 360.0,  # TFLOPs/s / GB/s -> FLOPs/byte
+        "peak_compute_tflops": 26.7,           # FP16/FP32 CUDA core peak
+        "peak_compute_tflops_tc": 53.4,        # FP16 Tensor Core (observed via cuDNN)
+        "tensor_tflops_datasheet": 327.6,      # Tensor perf from datasheet (INT8/sparse)
+        "peak_bandwidth_gb_s": 360.0,          # GDDR6
+        "ridge_ai": 26.7e3 / 360.0,            # Ridge point for CUDA cores
+        "ridge_ai_tc": 53.4e3 / 360.0,         # Ridge point for Tensor Cores
     }
 }
 
@@ -357,8 +372,9 @@ def generate_roofline_plot(
     # Determine axis range based on actual data
     all_ai = np.concatenate([naive_ai, flash_ai, cudnn_ai])
     all_perf = np.concatenate([naive_perf, flash_perf, cudnn_perf])
-    ai_min = min(all_ai.min(), gpu['ridge_ai']) / 2  # Include ridge point, with padding
-    ai_max = max(all_ai.max(), gpu['ridge_ai']) * 2
+    ridge_ai = gpu['ridge_ai']  # Use FP32 ridge point (Pallas achieves FP32-level)
+    ai_min = min(all_ai.min(), ridge_ai) / 2  # Include ridge point, with padding
+    ai_max = max(all_ai.max(), ridge_ai) * 2
 
     # Roofline calculations
     ai_range = np.logspace(np.log10(ai_min), np.log10(ai_max), 100)
@@ -367,16 +383,17 @@ def generate_roofline_plot(
     # GB/s * FLOPs/byte = 10^9 bytes/s * FLOPs/byte = 10^9 FLOPs/s = GFLOP/s
     memory_roof = gpu["peak_bandwidth_gb_s"] * ai_range
 
-    # Compute roof (horizontal)
-    compute_roof = gpu["peak_compute_tflops"] * 1000 * np.ones_like(ai_range)  # TFLOP/s -> GFLOP/s
+    # Compute roofs (horizontal) - show both FP32 and FP16 Tensor Core peaks
+    compute_roof_fp32 = gpu["peak_compute_tflops"] * 1000 * np.ones_like(ai_range)
+    compute_roof_tc = gpu["peak_compute_tflops_tc"] * 1000 * np.ones_like(ai_range)
 
-    # CRITICAL FIX: Cap memory roof at compute roof
-    # Memory roof should not exceed compute roof after ridge point
-    memory_roof = np.minimum(memory_roof, compute_roof)
+    # Cap memory roof at FP16 TC compute roof (the higher one)
+    memory_roof = np.minimum(memory_roof, compute_roof_tc)
 
     # Plot roofs
     ax.plot(ai_range, memory_roof, 'k--', linewidth=2, alpha=0.7, label='Memory roof')
-    ax.plot(ai_range, compute_roof, 'r--', linewidth=2, alpha=0.7, label='Compute roof')
+    ax.plot(ai_range, compute_roof_fp32, 'r--', linewidth=2, alpha=0.7, label='FP32 roof (26.7 TFLOP/s)')
+    ax.plot(ai_range, compute_roof_tc, 'g--', linewidth=2, alpha=0.7, label='FP16 TC roof (53.4 TFLOP/s)')
 
     # Plot actual performance
     ax.scatter(naive_ai, naive_perf, marker='o', s=150, c='red',
@@ -437,19 +454,17 @@ def generate_roofline_plot(
     ax.legend(loc='lower right', fontsize=11)
 
     # Add GPU specs text box
-    peak_compute_tflops_str = f"{gpu['peak_compute_tflops']:.1f} TFLOP/s"
-    peak_bw_str = f"{gpu['peak_bandwidth_gb_s']:.1f} GB/s"
-    ridge_ai_str = f"{gpu['ridge_ai']:.1f} FLOPs/byte"
-    
     specs_text_lines = [
         "GPU Specifications:",
-        f"  Peak Compute: {peak_compute_tflops_str}",
-        f"  Peak BW: {peak_bw_str}",
-        f"  Ridge AI: {ridge_ai_str}",
-        "  Note: 1 TFLOP/s = 1,000 GFLOP/s"
+        f"  CUDA peak: {gpu['peak_compute_tflops']:.1f} TFLOP/s",
+        f"  TC peak: {gpu['peak_compute_tflops_tc']:.1f} TFLOP/s",
+        f"  Bandwidth: {gpu['peak_bandwidth_gb_s']:.1f} GB/s",
+        "",
+        "Pallas: ~CUDA-level perf",
+        "cuDNN: full TC throughput",
     ]
     specs_text = "\n".join(specs_text_lines)
-    
+
     ax.text(0.02, 0.98, specs_text, transform=ax.transAxes, fontsize=9,
             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
 
@@ -498,9 +513,10 @@ def main():
     # Print GPU info
     gpu = GPU_SPECS[args.gpu]
     print(f"\nGPU: {gpu['name']}")
-    print(f"  Peak Compute (FP16):    {gpu['peak_compute_tflops']:.1f} TFLOP/s")
-    print(f"  Peak Memory Bandwidth:  {gpu['peak_bandwidth_gb_s']:.1f} GB/s")
-    print(f"  Ridge AI:               {gpu['ridge_ai']:.1f} FLOPs/byte")
+    print(f"  Peak Compute (CUDA cores):   {gpu['peak_compute_tflops']:.1f} TFLOP/s")
+    print(f"  Peak Compute (Tensor cores): {gpu['peak_compute_tflops_tc']:.1f} TFLOP/s (observed)")
+    print(f"  Peak Memory Bandwidth:       {gpu['peak_bandwidth_gb_s']:.1f} GB/s")
+    print(f"  Ridge AI (CUDA):             {gpu['ridge_ai']:.1f} FLOPs/byte")
 
     # Print configuration
     print(f"\nConfiguration:")
@@ -594,13 +610,15 @@ def main():
     # Verify GFLOPs/s against peak compute
     max_flash_gflops = np.max(results["flash"]["gflops_s"])
     max_cudnn_gflops = np.max(results["cudnn"]["gflops_s"])
-    peak_gflops = gpu["peak_compute_tflops"] * 1000  # Convert TFLOP/s to GFLOP/s
-    utilization_flash = (max_flash_gflops / peak_gflops) * 100
-    utilization_cudnn = (max_cudnn_gflops / peak_gflops) * 100
+    peak_fp32 = gpu["peak_compute_tflops"] * 1000
+    peak_tc = gpu["peak_compute_tflops_tc"] * 1000
+
     print(f"\nPeak verification:")
-    print(f"  GPU Peak Compute: {peak_gflops:.0f} GFLOP/s ({gpu['peak_compute_tflops']:.1f} TFLOP/s)")
-    print(f"  Max Achieved (flash): {max_flash_gflops:.0f} GFLOP/s ({utilization_flash:.1f}%)")
-    print(f"  Max Achieved (cuDNN): {max_cudnn_gflops:.0f} GFLOP/s ({utilization_cudnn:.1f}%)")
+    print(f"  GPU FP32 Peak:     {peak_fp32:.0f} GFLOP/s ({gpu['peak_compute_tflops']:.1f} TFLOP/s)")
+    print(f"  GPU FP16 TC Peak:  {peak_tc:.0f} GFLOP/s ({gpu['peak_compute_tflops_tc']:.1f} TFLOP/s)")
+    print(f"  Max Achieved (Pallas): {max_flash_gflops:.0f} GFLOP/s ({max_flash_gflops/peak_fp32*100:.1f}% of CUDA peak)")
+    print(f"  Max Achieved (cuDNN):  {max_cudnn_gflops:.0f} GFLOP/s ({max_cudnn_gflops/peak_tc*100:.1f}% of TC peak)")
+    print(f"\n  Note: Pallas/Triton should use TCs but achieves CUDA-level perf (optimization opportunity)")
     print(f"\n  FLOP counts (per B*H, forward + backward):")
     print(f"    Naive:  ~12*T^2*D (stores attention matrix, no recompute)")
     print(f"    Pallas: ~18*T^2*D (recomputes attention twice in backward)")
