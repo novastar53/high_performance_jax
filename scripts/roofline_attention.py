@@ -291,9 +291,9 @@ def generate_roofline_plot(
 
     # Ridge point annotation
     ridge_perf = gpu["peak_compute_tflops"]
-    ridge_ai_value = gpu["ridge_ai"]
-    ax.axvline(ridge_ai_value, color='gray', linestyle=':', alpha=0.5)
-    ax.text(ridge_ai_value, ridge_perf * 0.1, f'  Ridge\n  AI={ridge_ai_value:.1f}',
+    ridge_ai_str = f"{gpu['ridge_ai']:.1f}"
+    ax.axvline(ridge_ai_str, color='gray', linestyle=':', alpha=0.5)
+    ax.text(ridge_ai_str, ridge_perf * 0.1, f'  Ridge\n  AI={ridge_ai_str}',
             fontsize=10, rotation=90, va='bottom', ha='right')
 
     # Region annotations
@@ -316,13 +316,19 @@ def generate_roofline_plot(
     ax.legend(loc='lower right', fontsize=11)
 
     # Add GPU specs text box
-    specs_text = (
-        f'GPU Specifications:\n'
-        f'  Peak Compute: {gpu["peak_compute_tflops"]:.1f} TFLOP/s\n'
-        f'  Peak BW: {gpu["peak_bandwidth_gb_s"]:.1f} GB/s\n'
-        f'  Ridge AI: {ridge_ai:.1f} FLOPs/byte\n\n'
-        f'  Note: 1 TFLOP/s = 1,000 GFLOP/s'
-    )
+    peak_compute_tflops_str = f"{gpu['peak_compute_tflops']:.1f} TFLOP/s"
+    peak_bw_str = f"{gpu['peak_bandwidth_gb_s']:.1f} GB/s"
+    ridge_ai_str = f"{gpu['ridge_ai']:.1f} FLOPs/byte"
+    
+    specs_text_lines = [
+        "GPU Specifications:",
+        f"  Peak Compute: {peak_compute_tflops_str}",
+        f"  Peak BW: {peak_bw_str}",
+        f"  Ridge AI: {ridge_ai_str}",
+        "  Note: 1 TFLOP/s = 1,000 GFLOP/s"
+    ]
+    specs_text = "\n".join(specs_text_lines)
+    
     ax.text(0.02, 0.98, specs_text, transform=ax.transAxes, fontsize=9,
             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
 
