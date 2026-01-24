@@ -175,3 +175,6 @@ cython_debug/
 
 # JAX profiling traces
 traces/
+
+# NVIDIA Nsight profiles
+nsight_profiles/

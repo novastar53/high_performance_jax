@@ -3,8 +3,8 @@
 # Default Python version
 PYTHON_VERSION ?= 3.12.8
 
-# Default SSH port
-p ?= 22
+# Default SSH host (from ~/.ssh/config)
+host ?= runpod1
 
 # Detect platform
 UNAME_M := $(shell uname -m)
@@ -104,15 +104,15 @@ build: wheel sdist
 list:
 	uv pip list
 
-# SSH tunnel for Jupyter (usage: make jupyter-ssh-tunnel h=hostname k=keyfile [p=port])
+# SSH tunnel for Jupyter (usage: make jupyter-ssh-tunnel [host=runpod1])
 jupyter-ssh-tunnel:
-	ssh -L 8888:localhost:8888 -L 6006:localhost:6006 -p $(p) -i '$(k)' root@$(h)
+	ssh -L 8888:localhost:8888 -L 6006:localhost:6006 $(host)
 
-# SSH tunnel for xprof profiling (usage: make xprof-tunnel h=hostname k=keyfile [p=port])
+# SSH tunnel for xprof profiling (usage: make xprof-tunnel [host=runpod1])
 xprof-tunnel:
 	@echo "Starting SSH tunnel for xprof on port 8791..."
 	@echo "Open http://localhost:8791 in your browser"
-	ssh -L 8791:localhost:8791 -p $(p) -i '$(k)' root@$(h)
+	ssh -L 8791:localhost:8791 $(host)
 
 # Start xprof server locally (usage: make xprof-serve dir=<trace_path>)
 # Example: make xprof-serve dir=traces/2026-01-24/attention_fwd_B4_H8_T1024_D64_flash_attention
@@ -130,13 +130,51 @@ xprof-serve:
 xprof-list:
 	@uv run python -m high_performance_jax.profiling list
 
-# Download traces from remote machine (usage: make download-traces h=hostname k=keyfile [p=port])
+# Download traces from remote machine (usage: make download-traces [host=runpod1])
 download-traces:
-	@echo "Downloading traces from $(h)..."
+	@echo "Downloading traces from $(host)..."
 	@mkdir -p traces
-	scp -r -P $(p) -i '$(k)' root@$(h):/root/high_performance_jax/traces/* ./traces/
+	scp -r $(host):/root/high_performance_jax/traces/* ./traces/
 	@echo "Traces downloaded to ./traces/"
 	@echo "View with: make xprof-serve"
+
+# ============================================================================
+# NVIDIA Nsight Profiling (for detailed kernel analysis)
+# ============================================================================
+
+# Run Nsight Compute on remote (usage: make nsight-compute-remote [host=runpod1] [script=...])
+# Profiles kernel-level metrics: memory throughput, occupancy, warp stalls, etc.
+nsight-compute-remote:
+	@echo "Running Nsight Compute on $(host)..."
+	ssh $(host) 'cd /root/high_performance_jax && \
+		mkdir -p nsight_profiles && \
+		ncu --set full --export nsight_profiles/profile_$$(date +%Y%m%d_%H%M%S) \
+		python $(script:-scripts/profile_attention.py)'
+	@echo "Profile complete. Download with: make download-nsight"
+
+# Run Nsight Systems on remote (usage: make nsight-systems-remote [host=runpod1] [script=...])
+# Profiles system-level timeline: CPU/GPU activity, memory transfers, kernel launches
+nsight-systems-remote:
+	@echo "Running Nsight Systems on $(host)..."
+	ssh $(host) 'cd /root/high_performance_jax && \
+		mkdir -p nsight_profiles && \
+		nsys profile --stats=true --output=nsight_profiles/timeline_$$(date +%Y%m%d_%H%M%S) \
+		python $(script:-scripts/profile_attention.py)'
+	@echo "Profile complete. Download with: make download-nsight"
+
+# Download Nsight profiles from remote (usage: make download-nsight [host=runpod1])
+download-nsight:
+	@echo "Downloading Nsight profiles from $(host)..."
+	@mkdir -p nsight_profiles
+	scp -r $(host):/root/high_performance_jax/nsight_profiles/* ./nsight_profiles/
+	@echo "Profiles downloaded to ./nsight_profiles/"
+	@echo "Open .ncu-rep files with: ncu-ui <file>"
+	@echo "Open .nsys-rep files with: nsys-ui <file>"
+
+# List Nsight profiles
+nsight-list:
+	@echo "Local Nsight profiles:"
+	@ls -la nsight_profiles/ 2>/dev/null || echo "  No profiles found. Run make nsight-compute-remote or make nsight-systems-remote first."
 
 # Run Jupyter lab
 lab:
@@ -161,9 +199,13 @@ help:
 	@echo "  make sdist     - Create source distribution"
 	@echo "  make list      - Show installed packages"
 	@echo "  make lab       - Run Jupyter lab"
-	@echo "  make jupyter-ssh-tunnel - SSH tunnel to Jupyter lab (h=host k=keyfile [p=port])"
-	@echo "  make download-traces - Download traces from remote (h=host k=keyfile [p=port])"
+	@echo "  make jupyter-ssh-tunnel - SSH tunnel to Jupyter lab [host=runpod1]"
+	@echo "  make download-traces - Download traces from remote [host=runpod1]"
 	@echo "  make xprof-serve  - Start xprof server locally"
 	@echo "  make xprof-list   - List available traces"
-	@echo "  make xprof-tunnel - SSH tunnel for xprof (h=host k=keyfile [p=port])"
+	@echo "  make xprof-tunnel - SSH tunnel for xprof [host=runpod1]"
+	@echo "  make nsight-compute-remote - Run Nsight Compute [host=runpod1]"
+	@echo "  make nsight-systems-remote - Run Nsight Systems [host=runpod1]"
+	@echo "  make download-nsight - Download Nsight profiles [host=runpod1]"
+	@echo "  make nsight-list  - List local Nsight profiles"
 	@echo "  make help      - Show this help message"
