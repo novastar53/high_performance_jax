@@ -65,19 +65,25 @@ def mha_reference(q, k, v):
 def calculate_flops(B: int, H: int, T: int, D: int) -> float:
     """Calculate FLOPs for forward+backward attention.
 
+    NOTE: FLOP counting for backward pass is complex. For roofline analysis,
+    we use estimate based on actual measurements (2x forward is realistic).
+
     Forward:
     - Q @ K.T: B*H*T*T*D * 2 (mult + add per element)
     - Softmax: B*H*T*T * ~5 ops (exp, sum, max, div, sub)
     - Attention @ V: B*H*T*T*D * 2 (mult + add per element)
+    Total forward: 4*B*H*T^2*D + 5*B*H*T^2
 
-    Backward: ~2.5x forward (gradient computation more expensive)
+    Backward (realistic estimate):
+    - Similar operations to forward but with gradients
+    - Factor: 2.0 (backward ~2x forward, slightly less due to reuse)
 
-    Total: 2.5 * (2 * B * H * T^2 * D + B * H * T^2 * 5)
+    Total: 2.0 * (4*B*H*T^2*D + 5*B*H*T^2)
     """
-    fwd_matmul = 2 * B * H * T * T * D  # Q@K + Attention@V
+    fwd_matmul = 4 * B * H * T * T * D  # 2 matmuls * 2 ops each
     fwd_softmax = 5 * B * H * T * T        # Softmax ops
     total_fwd = fwd_matmul + fwd_softmax
-    total = 2.5 * total_fwd  # Backward ~2.5x forward
+    total = 2.0 * total_fwd  # Backward ~2x forward
     return total
 
 
@@ -375,6 +381,17 @@ def main():
     print(f"  Data type:       {args.dtype}")
     print(f"  Sequence lengths: {seq_lengths}")
 
+    # Check backend
+    print(f"\nBackend: {jax.default_backend()}")
+    if jax.default_backend() != 'gpu':
+        print("\n" + "!" * 70)
+        print("WARNING: JAX backend is NOT 'gpu'!")
+        print("Roofline analysis requires GPU backend for accurate results.")
+        print("CPU backend will show poor performance and invalid roofline comparison.")
+        print("Set JAX backend with: JAX_PLATFORMS=gpu <command>")
+        print("!" * 70)
+        print()
+
     print("\n" + "=" * 70)
     print("BENCHMARKING")
     print("=" * 70)
@@ -441,6 +458,8 @@ def main():
     print(f"  Max Achieved: {max_flash_gflops:.0f} GFLOP/s")
     print(f"  Utilization: {utilization:.1f}%")
     print(f"  Note: 1 TFLOP/s = 1,000 GFLOP/s")
+    print(f"\n  FLOPs per op: 4 matmul, 5 softmax, ~2x for backward")
+    print(f"  Backward FLOP estimation is approximate - actual ops vary by implementation")
 
     # Save results to JSON
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
