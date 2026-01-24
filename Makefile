@@ -1,4 +1,4 @@
-.PHONY: install clean build dev lint format sync all add add-dev remove regen-lock list lab help
+.PHONY: install clean build dev lint format sync all add add-dev remove regen-lock list lab roofline help
 
 # Default Python version
 PYTHON_VERSION ?= 3.12.8
@@ -180,7 +180,11 @@ nsight-list:
 lab:
 	cd notebooks && nohup uv run jupyter lab --NotebookApp.iopub_data_rate_limit=1.0e10 --NotebookApp.rate_limit_window=10.0 --no-browser --port=8888 > jupyter.log 2>&1 &
 	sleep 3
-	uv run jupyter server list 
+	uv run jupyter server list
+
+# Generate roofline plot for attention (usage: make roofline [batch=4] [heads=8] [head-dim=64] [seq-lengths=128,256,512,1024,2048,4096])
+roofline:
+	uv run python scripts/roofline_attention.py --batch $(batch) --heads $(heads) --head-dim $(head-dim) --seq-lengths "$(seq-lengths)"
 
 # Help command
 help:
@@ -204,6 +208,7 @@ help:
 	@echo "  make xprof-serve  - Start xprof server locally"
 	@echo "  make xprof-list   - List available traces"
 	@echo "  make xprof-tunnel - SSH tunnel for xprof [host=runpod1]"
+	@echo "  make roofline - Generate roofline plot for attention batch=4 heads=8 head-dim=64 seq-lengths=128,256,512,1024,2048,4096"
 	@echo "  make nsight-compute-remote - Run Nsight Compute [host=runpod1]"
 	@echo "  make nsight-systems-remote - Run Nsight Systems [host=runpod1]"
 	@echo "  make download-nsight - Download Nsight profiles [host=runpod1]"
