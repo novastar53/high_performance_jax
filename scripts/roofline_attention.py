@@ -62,32 +62,72 @@ def mha_reference(q, k, v):
     return jnp.einsum('bhqk,bhkd->bhqd', probs, v)
 
 
-def calculate_flops(B: int, H: int, T: int, D: int) -> float:
-    """Calculate FLOPs for forward+backward attention.
+def calculate_flops_fwd(B: int, H: int, T: int, D: int) -> float:
+    """Calculate FLOPs for forward attention only.
 
     Forward:
     - Q @ K.T: B*H*T*T*D * 2 (mult + add per element)
     - Softmax: B*H*T*T * ~5 ops (exp, sum, max, div, sub)
     - P @ V: B*H*T*T*D * 2 (mult + add per element)
     Total forward: 4*B*H*T^2*D + 5*B*H*T^2
+    """
+    fwd_matmul = 4 * B * H * T * T * D  # 2 matmuls * 2 ops each
+    fwd_softmax = 5 * B * H * T * T     # Softmax ops
+    return fwd_matmul + fwd_softmax
 
-    Backward (flash attention recomputes attention twice):
-    - dKV kernel: recomputes S = Q @ K^T, computes dP = dO @ V^T, dV = P^T @ dO, dK = dS^T @ Q
-      FLOPs: 4 matmuls * 2 * B*H*T^2*D = 8*B*H*T^2*D
-    - dQ kernel: recomputes S = Q @ K^T, computes dP = dO @ V^T, dQ = dS @ K
-      FLOPs: 3 matmuls * 2 * B*H*T^2*D = 6*B*H*T^2*D
+
+def calculate_flops_pallas(B: int, H: int, T: int, D: int) -> float:
+    """Calculate FLOPs for Pallas flash attention (forward + backward).
+
+    Our Pallas implementation recomputes attention twice in backward:
+    - dKV kernel: recomputes S = Q @ K^T, computes dP, dV, dK (4 matmuls)
+    - dQ kernel: recomputes S = Q @ K^T, computes dP, dQ (3 matmuls)
     Total backward: ~14*B*H*T^2*D
 
     Total: ~18*B*H*T^2*D (forward + backward)
     """
-    fwd_matmul = 4 * B * H * T * T * D  # 2 matmuls * 2 ops each
-    fwd_softmax = 5 * B * H * T * T     # Softmax ops
-    total_fwd = fwd_matmul + fwd_softmax
+    total_fwd = calculate_flops_fwd(B, H, T, D)
 
-    # Backward pass with flash attention recomputation
+    # Backward pass with flash attention recomputation (our implementation)
     bwd_dkv = 8 * B * H * T * T * D   # S recompute + dP + dV + dK
     bwd_dq = 6 * B * H * T * T * D    # S recompute + dP + dQ
     total_bwd = bwd_dkv + bwd_dq
+
+    return total_fwd + total_bwd
+
+
+def calculate_flops_cudnn(B: int, H: int, T: int, D: int) -> float:
+    """Calculate FLOPs for cuDNN flash attention (forward + backward).
+
+    cuDNN uses optimized backward that recomputes attention only once:
+    - Single fused backward: recomputes S once, computes dQ, dK, dV
+    Total backward: ~10*B*H*T^2*D
+
+    Total: ~14*B*H*T^2*D (forward + backward)
+    """
+    total_fwd = calculate_flops_fwd(B, H, T, D)
+
+    # cuDNN backward - more efficient, recomputes once
+    # S recompute: 2*T²*D, dP: 2*T²*D, dV: 2*T²*D, dQ: 2*T²*D, dK: 2*T²*D
+    total_bwd = 10 * B * H * T * T * D
+
+    return total_fwd + total_bwd
+
+
+def calculate_flops_naive(B: int, H: int, T: int, D: int) -> float:
+    """Calculate FLOPs for naive attention (forward + backward).
+
+    Naive attention stores the full attention matrix, so backward doesn't
+    need to recompute. Uses standard autodiff.
+
+    Forward: 4*B*H*T^2*D
+    Backward: ~8*B*H*T^2*D (dV, dP, dQ, dK matmuls)
+    Total: ~12*B*H*T^2*D
+    """
+    total_fwd = calculate_flops_fwd(B, H, T, D)
+
+    # Standard backward with stored attention matrix
+    total_bwd = 8 * B * H * T * T * D
 
     return total_fwd + total_bwd
 
@@ -165,8 +205,11 @@ def benchmark_attention(
     do = jax.random.normal(keys[3], (B, H, T, D), dtype=dtype)
 
     # Calculate FLOPs and bytes for this configuration
+    # Each implementation has different FLOP counts due to different backward algorithms
     bytes_per_elem = 2 if dtype == jnp.float16 else 4
-    flops = calculate_flops(B, H, T, D)
+    flops_naive = calculate_flops_naive(B, H, T, D)
+    flops_pallas = calculate_flops_pallas(B, H, T, D)
+    flops_cudnn = calculate_flops_cudnn(B, H, T, D)
     bytes_naive = calculate_bytes_naive(B, H, T, D, bytes_per_elem)
     bytes_flash = calculate_bytes_flash(B, H, T, D, bytes_per_elem)
 
@@ -194,8 +237,8 @@ def benchmark_attention(
     # Use median for robustness (ignore outliers)
     naive_time_s = np.median(naive_times)
     naive_time_ms = naive_time_s * 1000
-    naive_gflops_s = flops / (naive_time_s * 1e9)
-    naive_ai = flops / bytes_naive
+    naive_gflops_s = flops_naive / (naive_time_s * 1e9)
+    naive_ai = flops_naive / bytes_naive
     naive_bw_gb_s = bytes_naive / (naive_time_s * 1e9)
 
     # Time flash attention (our Pallas implementation)
@@ -222,8 +265,8 @@ def benchmark_attention(
     # Use median for robustness (ignore outliers)
     flash_time_s = np.median(flash_times)
     flash_time_ms = flash_time_s * 1000
-    flash_gflops_s = flops / (flash_time_s * 1e9)
-    flash_ai = flops / bytes_flash
+    flash_gflops_s = flops_pallas / (flash_time_s * 1e9)
+    flash_ai = flops_pallas / bytes_flash
     flash_bw_gb_s = bytes_flash / (flash_time_s * 1e9)
 
     # Time cuDNN attention (jax.nn.dot_product_attention)
@@ -249,8 +292,8 @@ def benchmark_attention(
 
     cudnn_time_s = np.median(cudnn_times)
     cudnn_time_ms = cudnn_time_s * 1000
-    cudnn_gflops_s = flops / (cudnn_time_s * 1e9)
-    cudnn_ai = flops / bytes_flash  # cuDNN uses flash attention, same memory pattern
+    cudnn_gflops_s = flops_cudnn / (cudnn_time_s * 1e9)
+    cudnn_ai = flops_cudnn / bytes_flash  # cuDNN uses flash attention, same memory pattern
     cudnn_bw_gb_s = bytes_flash / (cudnn_time_s * 1e9)
 
     speedup_flash = naive_time_ms / flash_time_ms
@@ -558,8 +601,10 @@ def main():
     print(f"  GPU Peak Compute: {peak_gflops:.0f} GFLOP/s ({gpu['peak_compute_tflops']:.1f} TFLOP/s)")
     print(f"  Max Achieved (flash): {max_flash_gflops:.0f} GFLOP/s ({utilization_flash:.1f}%)")
     print(f"  Max Achieved (cuDNN): {max_cudnn_gflops:.0f} GFLOP/s ({utilization_cudnn:.1f}%)")
-    print(f"\n  FLOPs: fwd ~4*T^2*D, bwd ~14*T^2*D (flash recomputes attention twice)")
-    print(f"  Note: cuDNN backward may use different algorithm with different FLOP count")
+    print(f"\n  FLOP counts (per B*H, forward + backward):")
+    print(f"    Naive:  ~12*T^2*D (stores attention matrix, no recompute)")
+    print(f"    Pallas: ~18*T^2*D (recomputes attention twice in backward)")
+    print(f"    cuDNN:  ~14*T^2*D (recomputes attention once in backward)")
 
     # Save results to JSON
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
