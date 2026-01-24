@@ -72,8 +72,8 @@ class ProfileConfig:
     host_tracer_level: int = 2  # 0=disabled, 1=user events, 2=default, 3=verbose
     device_tracer_level: int = 1  # 0=disabled, 1=enabled
     python_tracer_level: int = 0  # 0=disabled, 1=enabled
-    warmup_iters: int = 5  # Warmup iterations (outside trace) to ensure JIT compilation
-    profile_iters: int = 3  # Iterations to profile (after skip_first_in_trace)
+    warmup_iters: int = 1  # Warmup iterations (outside trace) to ensure JIT compilation
+    profile_iters: int = 5  # Iterations to profile (after skip_first_in_trace)
     organize_by_date: bool = True  # Organize traces by date
 
     def __post_init__(self):
