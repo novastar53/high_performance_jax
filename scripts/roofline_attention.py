@@ -291,8 +291,9 @@ def generate_roofline_plot(
 
     # Ridge point annotation
     ridge_perf = gpu["peak_compute_tflops"]
-    ax.axvline(ridge_ai, color='gray', linestyle=':', alpha=0.5)
-    ax.text(ridge_ai, ridge_perf * 0.1, f'  Ridge\n  AI={ridge_ai:.1f}',
+    ridge_ai_value = gpu["ridge_ai"]
+    ax.axvline(ridge_ai_value, color='gray', linestyle=':', alpha=0.5)
+    ax.text(ridge_ai_value, ridge_perf * 0.1, f'  Ridge\n  AI={ridge_ai_value:.1f}',
             fontsize=10, rotation=90, va='bottom', ha='right')
 
     # Region annotations
