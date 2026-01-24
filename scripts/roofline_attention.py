@@ -65,26 +65,31 @@ def mha_reference(q, k, v):
 def calculate_flops(B: int, H: int, T: int, D: int) -> float:
     """Calculate FLOPs for forward+backward attention.
 
-    NOTE: FLOP counting for backward pass is complex. For roofline analysis,
-    we use estimate based on actual measurements (2x forward is realistic).
-
     Forward:
     - Q @ K.T: B*H*T*T*D * 2 (mult + add per element)
     - Softmax: B*H*T*T * ~5 ops (exp, sum, max, div, sub)
-    - Attention @ V: B*H*T*T*D * 2 (mult + add per element)
+    - P @ V: B*H*T*T*D * 2 (mult + add per element)
     Total forward: 4*B*H*T^2*D + 5*B*H*T^2
 
-    Backward (realistic estimate):
-    - Similar operations to forward but with gradients
-    - Factor: 2.0 (backward ~2x forward, slightly less due to reuse)
+    Backward (flash attention recomputes attention twice):
+    - dKV kernel: recomputes S = Q @ K^T, computes dP = dO @ V^T, dV = P^T @ dO, dK = dS^T @ Q
+      FLOPs: 4 matmuls * 2 * B*H*T^2*D = 8*B*H*T^2*D
+    - dQ kernel: recomputes S = Q @ K^T, computes dP = dO @ V^T, dQ = dS @ K
+      FLOPs: 3 matmuls * 2 * B*H*T^2*D = 6*B*H*T^2*D
+    Total backward: ~14*B*H*T^2*D
 
-    Total: 2.0 * (4*B*H*T^2*D + 5*B*H*T^2)
+    Total: ~18*B*H*T^2*D (forward + backward)
     """
     fwd_matmul = 4 * B * H * T * T * D  # 2 matmuls * 2 ops each
-    fwd_softmax = 5 * B * H * T * T        # Softmax ops
+    fwd_softmax = 5 * B * H * T * T     # Softmax ops
     total_fwd = fwd_matmul + fwd_softmax
-    total = 2.0 * total_fwd  # Backward ~2x forward
-    return total
+
+    # Backward pass with flash attention recomputation
+    bwd_dkv = 8 * B * H * T * T * D   # S recompute + dP + dV + dK
+    bwd_dq = 6 * B * H * T * T * D    # S recompute + dP + dQ
+    total_bwd = bwd_dkv + bwd_dq
+
+    return total_fwd + total_bwd
 
 
 def calculate_bytes_naive(B: int, H: int, T: int, D: int, bytes_per_elem: int = 4) -> float:
