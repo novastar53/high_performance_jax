@@ -35,7 +35,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
 
-INTERPRET_MODE = True  # Set to False on GPU
+INTERPRET_MODE = False  # Set to False on GPU
 
 BLOCK_R = 64
 BLOCK_C = 64
