@@ -38,8 +38,14 @@ if jax.default_backend() == 'cpu':
     import high_performance_jax.pallas.pallas_flash_attn as flash_attn_module
     flash_attn_module.INTERPRET_MODE = True
     flash_attention = flash_attn_module.flash_attention
+    mha_reference = flash_attn_module.mha_reference
+    cudnn_attention = flash_attn_module.cudnn_attention
 else:
-    from high_performance_jax.pallas.pallas_flash_attn import flash_attention
+    from high_performance_jax.pallas.pallas_flash_attn import (
+        flash_attention,
+        mha_reference,
+        cudnn_attention,
+    )
 
 
 # GPU Specifications for RTX 4000 Ada
@@ -66,15 +72,6 @@ GPU_SPECS = {
         "ridge_ai_tc": 53.4e3 / 360.0,         # Ridge point for Tensor Cores
     }
 }
-
-
-def mha_reference(q, k, v):
-    """Reference multi-head attention (materializes N×N matrix)."""
-    d = q.shape[-1]
-    scale = 1.0 / jnp.sqrt(d)
-    logits = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
-    probs = jax.nn.softmax(logits, axis=-1)
-    return jnp.einsum('bhqk,bhkd->bhqd', probs, v)
 
 
 def calculate_flops_fwd(B: int, H: int, T: int, D: int) -> float:
@@ -183,16 +180,6 @@ def calculate_bytes_flash(B: int, H: int, T: int, D: int, bytes_per_elem: int = 
     )
     # Backward roughly doubles memory traffic (gradients similar size)
     return fwd_bytes * 2
-
-
-def cudnn_attention(q, k, v):
-    """JAX cuDNN attention - expects (B, H, T, D), uses cuDNN flash attention."""
-    # Transpose from (B, H, T, D) to (B, T, H, D) for jax.nn.dot_product_attention
-    q_t = jnp.transpose(q, (0, 2, 1, 3))
-    k_t = jnp.transpose(k, (0, 2, 1, 3))
-    v_t = jnp.transpose(v, (0, 2, 1, 3))
-    out = jax.nn.dot_product_attention(q_t, k_t, v_t, implementation='cudnn')
-    return jnp.transpose(out, (0, 2, 1, 3))  # Back to (B, H, T, D)
 
 
 def benchmark_attention(

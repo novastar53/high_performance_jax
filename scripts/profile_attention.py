@@ -26,16 +26,7 @@ from high_performance_jax.profiling import (
     print_traces,
     get_trace_dir,
 )
-from high_performance_jax.pallas.pallas_flash_attn import flash_attention
-
-
-def mha_reference(q, k, v):
-    """Reference multi-head attention (materializes N×N matrix)."""
-    d = q.shape[-1]
-    scale = 1.0 / jnp.sqrt(d)
-    logits = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
-    probs = jax.nn.softmax(logits, axis=-1)
-    return jnp.einsum('bhqk,bhkd->bhqd', probs, v)
+from high_performance_jax.pallas.pallas_flash_attn import flash_attention, mha_reference
 
 
 def profile_attention(B: int, H: int, T: int, D: int, dtype=jnp.float16):

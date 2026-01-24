@@ -43,20 +43,45 @@ NUM_WARPS = 4
 NUM_STAGES = 3
 
 
-# Reference implementation
+# Reference implementations
 
 @jax.jit
 def mha_reference(q, k, v):
-    """Reference multi-head attention: softmax(Q @ K^T / sqrt(d)) @ V"""
+    """Reference multi-head attention (materializes N×N matrix).
+
+    Computes: softmax(Q @ K^T / sqrt(d)) @ V
+    Input shape: (B, H, T, D) - batch, heads, sequence, head_dim
+    """
     d = q.shape[-1]
     scale = 1.0 / jnp.sqrt(d)
     logits = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
     probs = jax.nn.softmax(logits, axis=-1)
-    o = jnp.einsum('bhqk,bhkd->bhqd', probs, v)
+    return jnp.einsum('bhqk,bhkd->bhqd', probs, v)
+
+
+def _compute_logsumexp(q, k):
+    """Compute logsumexp of attention logits (for testing flash attention)."""
+    d = q.shape[-1]
+    scale = 1.0 / jnp.sqrt(d)
+    logits = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
     logits_max = jnp.max(logits, axis=-1)
     logits_shift = logits - logits_max[..., None]
-    logsumexp =  logits_max + jnp.log(jnp.sum(jnp.exp(logits_shift), axis=-1))
-    return o, logsumexp
+    return logits_max + jnp.log(jnp.sum(jnp.exp(logits_shift), axis=-1))
+
+
+@jax.jit
+def cudnn_attention(q, k, v):
+    """JAX cuDNN flash attention wrapper.
+
+    Wraps jax.nn.dot_product_attention with layout transposition.
+    Input/output shape: (B, H, T, D) - batch, heads, sequence, head_dim
+    """
+    # Transpose from (B, H, T, D) to (B, T, H, D) for jax.nn.dot_product_attention
+    q_t = jnp.transpose(q, (0, 2, 1, 3))
+    k_t = jnp.transpose(k, (0, 2, 1, 3))
+    v_t = jnp.transpose(v, (0, 2, 1, 3))
+    out = jax.nn.dot_product_attention(q_t, k_t, v_t, implementation='cudnn')
+    return jnp.transpose(out, (0, 2, 1, 3))  # Back to (B, H, T, D)
 
 
 # Flash Attention Forward
@@ -416,13 +441,13 @@ if __name__ == "__main__":
     do = jax.random.normal(keys[3], (B, H, T, D), dtype=jnp.float32)
 
     # Forward check
-    o_ref, logsumexp_ref = mha_reference(q, k, v)
+    o_ref = mha_reference(q, k, v)
+    logsumexp_ref = _compute_logsumexp(q, k)
     print(f"Reference output shape: {o_ref.shape}")
 
     # Backward check (reference)
     def loss_ref(q, k, v):
-        O, _ = mha_reference(q, k, v)
-        return jnp.sum(O * do)
+        return jnp.sum(mha_reference(q, k, v) * do)
 
     dq_ref, dk_ref, dv_ref = jax.grad(loss_ref, argnums=(0, 1, 2))(q, k, v)
     print(f"Reference gradient shapes: dq={dq_ref.shape}, dk={dk_ref.shape}, dv={dv_ref.shape}")
@@ -511,8 +536,7 @@ if __name__ == "__main__":
     # Reference (materialized attention matrix)
     @jax.jit
     def reference_attention(q, k, v):
-        o, _ = mha_reference(q, k, v)
-        return o
+        return mha_reference(q, k, v)
 
     print("\nForward pass:")
     t_jax = _bench_fwd(jax_dot_product_attention, q_bench, k_bench, v_bench)
