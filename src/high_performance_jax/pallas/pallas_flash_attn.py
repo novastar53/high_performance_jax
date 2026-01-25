@@ -36,12 +36,18 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
 
-INTERPRET_MODE = False  # Set to False on GPU
+INTERPRET_MODE = True  # Set to False on GPU
 
 BLOCK_R = 64
 BLOCK_C = 64
 NUM_WARPS = 4
 NUM_STAGES = 3
+DTYPE = jnp.bfloat16
+JAX_SDPA_IMPL = "cudnn"
+
+if INTERPRET_MODE:
+    JAX_SDPA_IMPL = "xla"
+
 
 
 # Reference implementations
@@ -81,7 +87,7 @@ def cudnn_attention(q, k, v):
     q_t = jnp.transpose(q, (0, 2, 1, 3))
     k_t = jnp.transpose(k, (0, 2, 1, 3))
     v_t = jnp.transpose(v, (0, 2, 1, 3))
-    out = jax.nn.dot_product_attention(q_t, k_t, v_t, implementation='cudnn')
+    out = jax.nn.dot_product_attention(q_t, k_t, v_t, implementation=JAX_SDPA_IMPL)
     return jnp.transpose(out, (0, 2, 1, 3))  # Back to (B, H, T, D)
 
 
@@ -89,7 +95,7 @@ def cudnn_attention(q, k, v):
 
 def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, scale, num_k_blocks):
     """Flash attention forward kernel."""
-    q_reg = plgpu.load(q_ref.at[0, :, :]).astype(jnp.float32)
+    q_reg = plgpu.load(q_ref.at[0, :, :])
     o_reg = jnp.zeros(q_reg.shape, jnp.float32)
     max_reg = jnp.full((BLOCK_R,), -jnp.inf, dtype=jnp.float32)
     l_reg = jnp.zeros((BLOCK_R,), dtype=jnp.float32)
@@ -98,8 +104,8 @@ def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, sca
     def num_body(t, args):
         max_reg, l_reg, o_reg = args
         idx = pl.dslice(t * BLOCK_C, BLOCK_C)
-        k_blk = plgpu.load(k_ref.at[0, idx, :]).astype(jnp.float32)
-        v_blk = plgpu.load(v_ref.at[0, idx, :]).astype(jnp.float32)
+        k_blk = plgpu.load(k_ref.at[0, idx, :])
+        v_blk = plgpu.load(v_ref.at[0, idx, :])
         s_blk = pl.dot(q_reg, k_blk, trans_b=True) / scale
         max_blk = jnp.maximum(max_reg, jnp.max(s_blk, axis=-1))
         s_blk = jnp.exp(s_blk - max_blk[:, None])
@@ -171,9 +177,9 @@ def flash_attention_bwd_preprocess_kernel(o_ref, do_ref, d_ref):
     D is used in the softmax backward: dS = P ⊙ (dP - D)
     where D_i = sum_j(dO_ij * O_ij)
     """
-    o_reg = plgpu.load(o_ref).astype(jnp.float32)
-    do_reg = plgpu.load(do_ref).astype(jnp.float32)
-    d_reg = jnp.sum(o_reg * do_reg, axis=-1)
+    o_reg = plgpu.load(o_ref)
+    do_reg = plgpu.load(do_ref)
+    d_reg = jnp.sum((o_reg * do_reg).astype(jnp.float32), axis=-1)
     plgpu.store(d_ref, d_reg.astype(d_ref.dtype))
 
 
@@ -184,7 +190,7 @@ def flash_attention_bwd_preprocess(o_flat, do_flat):
 
     d_flat = pl.pallas_call(
         flash_attention_bwd_preprocess_kernel,
-        out_shape=jax.ShapeDtypeStruct((B_flat, T), jnp.float32),
+        out_shape=jax.ShapeDtypeStruct((B_flat, T), o_flat.dtype),
         grid=grid,
         in_specs=[
             pl.BlockSpec((1, BLOCK_R, C), lambda b, t: (b, t, 0)),  # o
@@ -215,36 +221,27 @@ def flash_attention_bwd_dkv_kernel(
         dV += P^T @ dO
         dK += dS^T @ Q  (where dS = P ⊙ (dP - D))
     """
-    # Load K, V block for this program
-    k_reg = plgpu.load(k_ref.at[0, :, :]).astype(jnp.float32)
-    v_reg = plgpu.load(v_ref.at[0, :, :]).astype(jnp.float32)
+    k_reg = plgpu.load(k_ref.at[0, :, :])
+    v_reg = plgpu.load(v_ref.at[0, :, :])
 
-    # Initialize dK_acc, dV_acc to zeros (use float32 for numerical stability)
     dk_acc = jnp.zeros(dk_ref.shape, dtype=jnp.float32)
     dv_acc = jnp.zeros(dv_ref.shape, dtype=jnp.float32)
-    # Loop over all Q blocks:
     def body(t, carry):
         dk_acc, dv_acc = carry
         idx = pl.dslice(t * BLOCK_R, BLOCK_R)
-    #   Load Q, dO, logsumexp, D for current Q block
-        q_blk = plgpu.load(q_ref.at[0, idx, :]).astype(jnp.float32)
-        do_blk = plgpu.load(do_ref.at[0, idx, :]).astype(jnp.float32)
-        logsumexp_blk = plgpu.load(logsumexp_ref.at[0, idx]).astype(jnp.float32)
-        d_blk = plgpu.load(d_ref.at[0, idx]).astype(jnp.float32)
-    #   Recompute P = softmax(Q @ K^T / scale) using logsumexp
+        q_blk = plgpu.load(q_ref.at[0, idx, :])
+        do_blk = plgpu.load(do_ref.at[0, idx, :])
+        logsumexp_blk = plgpu.load(logsumexp_ref.at[0, idx])
+        d_blk = plgpu.load(d_ref.at[0, idx])
         s_blk = pl.dot(q_blk, k_reg, trans_b=True) / scale
         p_blk = jnp.exp(s_blk - logsumexp_blk[..., None])
-    #   Compute dP = dO @ V^T
         dp_blk = pl.dot(do_blk, v_reg, trans_b=True)
-    #   Compute dS = P * (dP - D)
         ds_blk = p_blk * (dp_blk - d_blk[..., None]) / scale
-    #   Accumulate: dV += P^T @ dO, dK += dS^T @ Q
         dv_acc += pl.dot(p_blk, do_blk, trans_a=True)
         dk_acc += pl.dot(ds_blk, q_blk, trans_a=True)
         return dk_acc, dv_acc
         
     dk_acc, dv_acc = jax.lax.fori_loop(0, num_q_blocks, body, (dk_acc, dv_acc))
-    # Store dK, dV
     plgpu.store(dk_ref, dk_acc.astype(dk_ref.dtype))
     plgpu.store(dv_ref, dv_acc.astype(dv_ref.dtype))
 
@@ -297,30 +294,22 @@ def flash_attention_bwd_dq_kernel(
     For each Q block, we accumulate:
         dQ += dS @ K  (where dS = P ⊙ (dP - D))
     """
-    # Load Q, dO, logsumexp, D for this Q block
-    q_reg = plgpu.load(q_ref.at[0, :, :]).astype(jnp.float32)
-    do_reg = plgpu.load(do_ref.at[0, :, :]).astype(jnp.float32)
-    logsumexp_reg = plgpu.load(logsumexp_ref.at[0, :]).astype(jnp.float32)
-    d_reg = plgpu.load(d_ref.at[0, :]).astype(jnp.float32)
+    q_reg = plgpu.load(q_ref.at[0, :, :])
+    do_reg = plgpu.load(do_ref.at[0, :, :])
+    logsumexp_reg = plgpu.load(logsumexp_ref.at[0, :])
+    d_reg = plgpu.load(d_ref.at[0, :])
     dq_acc = jnp.zeros(dq_ref.shape, dtype=jnp.float32)  # Use float32 for numerical stability
-    # Loop over all KV blocks:
     def body(t, carry):
         dq_acc = carry
-    #   Load K, V for current KV block
         idx = pl.dslice(t * BLOCK_C, BLOCK_C)
-        k_blk = plgpu.load(k_ref.at[0, idx, :]).astype(jnp.float32)
-        v_blk = plgpu.load(v_ref.at[0, idx, :]).astype(jnp.float32)
-    #   Recompute P = softmax(Q @ K^T / scale) using logsumexp
+        k_blk = plgpu.load(k_ref.at[0, idx, :])
+        v_blk = plgpu.load(v_ref.at[0, idx, :])
         s_blk = pl.dot(q_reg, k_blk, trans_b=True) / scale
         p_blk = jnp.exp(s_blk - logsumexp_reg[..., None])
-    #   Compute dP = dO @ V^T
         dp_blk = pl.dot(do_reg, v_blk, trans_b=True)
-    #   Compute dS = P * (dP - D)
         ds_blk = p_blk * ( dp_blk - d_reg[..., None] ) / scale
-    #   Accumulate: dQ += dS @ K
         dq_acc += pl.dot(ds_blk, k_blk)
         return dq_acc
-    # Store dQ
     dq_acc = jax.lax.fori_loop(0, num_kv_blocks, body, dq_acc)
     plgpu.store(dq_ref, dq_acc.astype(dq_ref.dtype))
 
@@ -426,15 +415,15 @@ if __name__ == "__main__":
     key = jax.random.key(0)
     keys = jax.random.split(key, 4)
 
-    q = jax.random.normal(keys[0], (B, H, T, D), dtype=jnp.float32)
-    k = jax.random.normal(keys[1], (B, H, T, D), dtype=jnp.float32)
-    v = jax.random.normal(keys[2], (B, H, T, D), dtype=jnp.float32)
-    do = jax.random.normal(keys[3], (B, H, T, D), dtype=jnp.float32)
+    q = jax.random.normal(keys[0], (B, H, T, D), dtype=DTYPE)
+    k = jax.random.normal(keys[1], (B, H, T, D), dtype=DTYPE)
+    v = jax.random.normal(keys[2], (B, H, T, D), dtype=DTYPE)
+    do = jax.random.normal(keys[3], (B, H, T, D), dtype=DTYPE)
 
     # Forward check
     o_ref = mha_reference(q, k, v)
     logsumexp_ref = _compute_logsumexp(q, k)
-    print(f"Reference output shape: {o_ref.shape}")
+    print(f"Reference output shape: {o_ref.dtype, o_ref.shape}")
 
     # Backward check (reference)
     def loss_ref(q, k, v):
@@ -450,7 +439,7 @@ if __name__ == "__main__":
     print("Forward pass check passed!")
 
     # Test preprocess kernel: D = rowsum(O * dO)
-    d_ref = jnp.sum(o_ref * do, axis=-1)  # (B, H, T)
+    d_ref = jnp.sum((o_flash * do).astype(jnp.float32), axis=-1).astype(DTYPE)  # (B, H, T)
     o_flat = o_flash.reshape(-1, T, D)
     do_flat = do.reshape(-1, T, D)
     d_flash = flash_attention_bwd_preprocess(o_flat, do_flat).reshape(B, H, T)
@@ -472,12 +461,12 @@ if __name__ == "__main__":
     print("="*60)
 
     # Use larger sizes for meaningful timing
-    # Use float16 for cuDNN compatibility
+    # Use bfloat16 for cuDNN compatibility
     B_bench, H_bench, T_bench, D_bench = 4, 8, 2048, 64
-    q_bench = jax.random.normal(keys[0], (B_bench, H_bench, T_bench, D_bench), dtype=jnp.bfloat16)
-    k_bench = jax.random.normal(keys[1], (B_bench, H_bench, T_bench, D_bench), dtype=jnp.bfloat16)
-    v_bench = jax.random.normal(keys[2], (B_bench, H_bench, T_bench, D_bench), dtype=jnp.bfloat16)
-    do_bench = jax.random.normal(keys[3], (B_bench, H_bench, T_bench, D_bench), dtype=jnp.bfloat16)
+    q_bench = jax.random.normal(keys[0], (B_bench, H_bench, T_bench, D_bench), dtype=DTYPE)
+    k_bench = jax.random.normal(keys[1], (B_bench, H_bench, T_bench, D_bench), dtype=DTYPE)
+    v_bench = jax.random.normal(keys[2], (B_bench, H_bench, T_bench, D_bench), dtype=DTYPE)
+    do_bench = jax.random.normal(keys[3], (B_bench, H_bench, T_bench, D_bench), dtype=DTYPE)
 
     print(f"Benchmark shape: B={B_bench}, H={H_bench}, T={T_bench}, D={D_bench}")
 
