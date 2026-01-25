@@ -422,16 +422,6 @@ flash_attention.defvjp(flash_attention_fwd_rule, flash_attention_bwd_rule)
 if __name__ == "__main__":
     import time
 
-    def _bench(fn, *args, iters=10):
-        for _ in range(3):  # warmup
-            fn(*args).block_until_ready()
-        times = []
-        for _ in range(iters):
-            t0 = time.perf_counter()
-            fn(*args).block_until_ready()
-            times.append(time.perf_counter() - t0)
-        return sum(times) / len(times)
-
     B, H, T, D = 2, 2, 256, 64
     key = jax.random.key(0)
     keys = jax.random.split(key, 4)
@@ -484,10 +474,10 @@ if __name__ == "__main__":
     # Use larger sizes for meaningful timing
     # Use float16 for cuDNN compatibility
     B_bench, H_bench, T_bench, D_bench = 4, 8, 2048, 64
-    q_bench = jax.random.normal(keys[0], (B_bench, H_bench, T_bench, D_bench), dtype=jnp.float16)
-    k_bench = jax.random.normal(keys[1], (B_bench, H_bench, T_bench, D_bench), dtype=jnp.float16)
-    v_bench = jax.random.normal(keys[2], (B_bench, H_bench, T_bench, D_bench), dtype=jnp.float16)
-    do_bench = jax.random.normal(keys[3], (B_bench, H_bench, T_bench, D_bench), dtype=jnp.float16)
+    q_bench = jax.random.normal(keys[0], (B_bench, H_bench, T_bench, D_bench), dtype=jnp.bfloat16)
+    k_bench = jax.random.normal(keys[1], (B_bench, H_bench, T_bench, D_bench), dtype=jnp.bfloat16)
+    v_bench = jax.random.normal(keys[2], (B_bench, H_bench, T_bench, D_bench), dtype=jnp.bfloat16)
+    do_bench = jax.random.normal(keys[3], (B_bench, H_bench, T_bench, D_bench), dtype=jnp.bfloat16)
 
     print(f"Benchmark shape: B={B_bench}, H={H_bench}, T={T_bench}, D={D_bench}")
 

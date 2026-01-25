@@ -58,44 +58,19 @@ else:
 # GPU Specifications dictionary mapping GPU_MODEL values to specs
 GPU_MODEL_TO_SPECS = {
     # NVIDIA RTX 4000 Ada
-    "NVIDIA RTX 4000 Ada": {
-        "peak_compute_tflops": 26.7,           # FP32 CUDA core peak
-        "peak_compute_tflops_tc": 106.91,      # FP16 Tensor Core theoretical peak
-        "tensor_tflops_datasheet": 327.6,      # Tensor perf from datasheet (INT8/sparse)
-        "peak_bandwidth_gb_s": 360.0,          # GDDR6 (335.3 GiB/s)
-        "ridge_ai": 26.7e3 / 360.0,            # Ridge point for CUDA cores (~74)
-        "ridge_ai_tc": 106.91e3 / 360.0,       # Ridge point for Tensor Cores (~297)
+    "NVIDIA RTX 4000 Ada Generation": {
+        "peak_compute_tflops": 26.7,
+        "peak_compute_tflops_tc": 106.91,
+        "tensor_tflops_datasheet": 327.6,
+        "peak_bandwidth_gb_s": 360.0,
+        "ridge_ai": 26.7e3 / 360.0,
+        "ridge_ai_tc": 106.91e3 / 360.0,
     },
-}
-
-# GPU Specifications for RTX 4000 Ada (legacy format, now uses GPU_MODEL_TO_SPECS)
-# From xprof / NVIDIA specs:
-# - FP32 CUDA cores: 26.7 TFLOP/s
-# - FP16 Tensor Cores: 106.91 TFLOP/s (theoretical peak from xprof)
-# - Tensor Performance: 327.6 TFLOP/s (INT8/sparse modes from datasheet)
-# - Memory Bandwidth: 360 GB/s (335.3 GiB/s)
-#
-# Observed performance:
-# - Pallas flash attention: ~27 TFLOP/s (~25% of TC peak)
-#   (Should use tensor cores via Triton, but achieves CUDA-core level perf.
-#    Likely due to suboptimal block sizes, memory patterns, or loop overhead.)
-# - cuDNN flash attention: ~55 TFLOP/s (~50% of TC peak)
-#   (Highly optimized, typical efficiency for real workloads)
-GPU_SPECS = {
-    "rtx4000-ada": {
-        "name": "NVIDIA RTX 4000 Ada",
-        "peak_compute_tflops": 26.7,           # FP32 CUDA core peak
-        "peak_compute_tflops_tc": 106.91,      # FP16 Tensor Core theoretical peak
-        "tensor_tflops_datasheet": 327.6,      # Tensor perf from datasheet (INT8/sparse)
-        "peak_bandwidth_gb_s": 360.0,          # GDDR6 (335.3 GiB/s)
-        "ridge_ai": 26.7e3 / 360.0,            # Ridge point for CUDA cores (~74)
-        "ridge_ai_tc": 106.91e3 / 360.0,       # Ridge point for Tensor Cores (~297)
-    }
 }
 
 
 def get_gpu_specs(gpu_model: str) -> dict:
-    """Get GPU specifications for the given GPU model.
+    """Get GPU specifications for given GPU model.
 
     Args:
         gpu_model: GPU model name (e.g., "NVIDIA RTX 4000 Ada")
@@ -107,19 +82,19 @@ def get_gpu_specs(gpu_model: str) -> dict:
         specs = GPU_MODEL_TO_SPECS[gpu_model].copy()
         specs["name"] = gpu_model
         return specs
-    else:
-        print(f"Warning: GPU model '{gpu_model}' not found in GPU_MODEL_TO_SPECS")
-        print("Available GPU models: " + ", ".join(GPU_MODEL_TO_SPECS.keys()))
-        print("Using default RTX 4000 Ada specs - please update GPU_MODEL_TO_SPECS")
-        return {
-            "name": gpu_model,
-            "peak_compute_tflops": 26.7,
-            "peak_compute_tflops_tc": 106.91,
-            "tensor_tflops_datasheet": 327.6,
-            "peak_bandwidth_gb_s": 360.0,
-            "ridge_ai": 26.7e3 / 360.0,
-            "ridge_ai_tc": 106.91e3 / 360.0,
-        }
+
+    print(f"Warning: GPU model '{gpu_model}' not found in GPU_MODEL_TO_SPECS")
+    print("Available GPU models: " + ", ".join(GPU_MODEL_TO_SPECS.keys()))
+    print("Using default RTX 4000 Ada specs - please update GPU_MODEL_TO_SPECS")
+    return {
+        "name": gpu_model,
+        "peak_compute_tflops": 26.7,
+        "peak_compute_tflops_tc": 106.91,
+        "tensor_tflops_datasheet": 327.6,
+        "peak_bandwidth_gb_s": 360.0,
+        "ridge_ai": 26.7e3 / 360.0,
+        "ridge_ai_tc": 106.91e3 / 360.0,
+    }
 
 
 def calculate_flops_fwd(B: int, H: int, T: int, D: int) -> float:
@@ -355,6 +330,7 @@ def generate_roofline_plot(
     results: dict,
     pass_type: str = "fwd",
     gpu_model: str = None,
+    dtype: str = None,
     output_path: Path | None = None,
 ):
     """Generate roofline plot for forward or backward pass.
@@ -363,13 +339,25 @@ def generate_roofline_plot(
         results: Dict with 'sequence_lengths', 'naive', 'flash', 'cudnn' data
         pass_type: "fwd" for forward pass, "bwd" for backward pass
         gpu_model: GPU model name (e.g., "NVIDIA RTX 4000 Ada")
+        dtype: Data type ("float16" or "float32") - determines which ridge to show
         output_path: Path to save PNG plot
     """
     if gpu_model is None:
         gpu_model = os.environ.get("GPU_MODEL", "NVIDIA RTX 4000 Ada")
 
+    if dtype is None:
+        dtype = results.get("config", {}).get("dtype", "float16")
+
     gpu = get_gpu_specs(gpu_model)
     pass_name = "Forward" if pass_type == "fwd" else "Backward"
+
+    # Determine which ridge to use based on dtype
+    if dtype == "float32":
+        ridge_ai = gpu['ridge_ai']
+        ridge_label = "Ridge (FP32)"
+    else:
+        ridge_ai = gpu['ridge_ai_tc']
+        ridge_label = "Ridge (BF16/FP16)"
 
     seq_lengths = np.array(results["sequence_lengths"])
 
@@ -387,8 +375,7 @@ def generate_roofline_plot(
     # Determine axis range based on actual data
     all_ai = np.concatenate([naive_ai, flash_ai, cudnn_ai])
     all_perf = np.concatenate([naive_perf, flash_perf, cudnn_perf])
-    ridge_ai = gpu['ridge_ai']  # Use FP32 ridge point (Pallas achieves FP32-level)
-    ai_min = min(all_ai.min(), ridge_ai) / 2  # Include ridge point, with padding
+    ai_min = min(all_ai.min(), ridge_ai) / 2
     ai_max = max(all_ai.max(), ridge_ai) * 2
 
     # Roofline calculations
@@ -398,17 +385,20 @@ def generate_roofline_plot(
     # GB/s * FLOPs/byte = 10^9 bytes/s * FLOPs/byte = 10^9 FLOPs/s = GFLOP/s
     memory_roof = gpu["peak_bandwidth_gb_s"] * ai_range
 
-    # Compute roofs (horizontal) - show both FP32 and FP16 Tensor Core peaks
-    compute_roof_fp32 = gpu["peak_compute_tflops"] * 1000 * np.ones_like(ai_range)
-    compute_roof_tc = gpu["peak_compute_tflops_tc"] * 1000 * np.ones_like(ai_range)
+    # Compute roof (horizontal) - use appropriate peak based on dtype
+    if dtype == "float32":
+        compute_roof = gpu["peak_compute_tflops"] * 1000 * np.ones_like(ai_range)
+        compute_label = f'FP32 roof ({gpu["peak_compute_tflops"]:.1f} TFLOP/s)'
+    else:
+        compute_roof = gpu["peak_compute_tflops_tc"] * 1000 * np.ones_like(ai_range)
+        compute_label = f'FP16 TC roof ({gpu["peak_compute_tflops_tc"]:.1f} TFLOP/s)'
 
-    # Cap memory roof at FP16 TC compute roof (the higher one)
-    memory_roof = np.minimum(memory_roof, compute_roof_tc)
+    # Cap memory roof at compute roof
+    memory_roof = np.minimum(memory_roof, compute_roof)
 
     # Plot roofs
     ax.plot(ai_range, memory_roof, 'k--', linewidth=2, alpha=0.7, label='Memory roof')
-    ax.plot(ai_range, compute_roof_fp32, 'r--', linewidth=2, alpha=0.7, label=f'FP32 roof ({gpu["peak_compute_tflops"]:.1f} TFLOP/s)')
-    ax.plot(ai_range, compute_roof_tc, 'g--', linewidth=2, alpha=0.7, label=f'FP16 TC roof ({gpu["peak_compute_tflops_tc"]:.1f} TFLOP/s)')
+    ax.plot(ai_range, compute_roof, 'r--', linewidth=2, alpha=0.7, label=compute_label)
 
     # Plot actual performance
     ax.scatter(naive_ai, naive_perf, marker='o', s=150, c='red',
@@ -436,13 +426,12 @@ def generate_roofline_plot(
                         ha='left', va='center')
 
     # Ridge point annotation
-    ridge_perf_fp32 = gpu["peak_compute_tflops"] * 1000  # Convert TFLOP/s to GFLOP/s
-    ridge_ai = gpu['ridge_ai']
+    ridge_perf_fp32 = gpu["peak_compute_tflops"] * 1000
     ax.axvline(ridge_ai, color='gray', linestyle=':', alpha=0.5)
-    ax.text(ridge_ai, ridge_perf_fp32 * 0.1, f'  Ridge\n  AI={ridge_ai:.1f}',
+    ax.text(ridge_ai, ridge_perf_fp32 * 0.1, f'  {ridge_label}\n  AI={ridge_ai:.1f}',
             fontsize=10, rotation=90, va='bottom', ha='right')
 
-    # Region annotations - position relative to ridge point (use FP32 peak as reference)
+    # Region annotations
     ax.text(ridge_ai / 3, ridge_perf_fp32 * 1.2, 'Memory-Bound\n(AI < Ridge)',
             fontsize=11, ha='center', va='top',
             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
@@ -460,10 +449,10 @@ def generate_roofline_plot(
     # Set axis limits based on data range
     ax.set_xlim(ai_min, ai_max)
     perf_min = all_perf.min() / 2
-    perf_max = max(all_perf.max(), ridge_perf_fp32, compute_roof_tc[0]) * 1.5
+    perf_max = max(all_perf.max(), compute_roof[0]) * 1.5
     ax.set_ylim(perf_min, perf_max)
 
-    ax.set_title(f'Roofline Analysis ({pass_name} Pass): Naive vs Flash (Pallas) vs cuDNN\n{gpu["name"]}',
+    ax.set_title(f'Roofline Analysis ({pass_name} Pass, {dtype.upper()}): Naive vs Flash (Pallas) vs cuDNN\n{gpu["name"]}',
                  fontsize=14, fontweight='bold')
     ax.grid(True, alpha=0.3)
     ax.legend(loc='lower right', fontsize=11)
@@ -668,8 +657,8 @@ def main():
 
     # Generate separate forward and backward roofline plots
     if not args.no_plot:
-        fwd_plot = generate_roofline_plot(results, pass_type="fwd", gpu_model=gpu_model)
-        bwd_plot = generate_roofline_plot(results, pass_type="bwd", gpu_model=gpu_model)
+        fwd_plot = generate_roofline_plot(results, pass_type="fwd", gpu_model=gpu_model, dtype=args.dtype)
+        bwd_plot = generate_roofline_plot(results, pass_type="bwd", gpu_model=gpu_model, dtype=args.dtype)
         print(f"\nDone! View plots at:")
         print(f"  Forward:  {fwd_plot}")
         print(f"  Backward: {bwd_plot}")

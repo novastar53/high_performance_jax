@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import os
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -34,7 +35,7 @@ from high_performance_jax.pallas.pallas_flash_attn import flash_attention, mha_r
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 
-def profile_attention(B: int, H: int, T: int, D: int, dtype=jnp.float16):
+def profile_attention(B: int, H: int, T: int, D: int, dtype=jnp.bfloat16):
     """Profile forward and backward passes separately for each attention implementation."""
     print(f"\nProfiling attention: B={B}, H={H}, T={T}, D={D}, dtype={dtype}")
 

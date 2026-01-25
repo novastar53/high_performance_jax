@@ -26,7 +26,7 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 # GPU Specifications dictionary mapping GPU_MODEL values to specs
 GPU_MODEL_TO_SPECS = {
     # NVIDIA RTX 4000 Ada
-    "NVIDIA RTX 4000 Ada": {
+    "NVIDIA RTX 4000 Ada Generation": {
         "peak_compute_tflops": 26.7,
         "peak_compute_tflops_tc": 106.91,
         "tensor_tflops_datasheet": 327.6,
@@ -38,7 +38,7 @@ GPU_MODEL_TO_SPECS = {
 
 
 def get_gpu_specs(gpu_model: str) -> dict:
-    """Get GPU specifications for the given GPU model.
+    """Get GPU specifications for given GPU model.
 
     Args:
         gpu_model: GPU model name (e.g., "NVIDIA RTX 4000 Ada")
@@ -50,19 +50,19 @@ def get_gpu_specs(gpu_model: str) -> dict:
         specs = GPU_MODEL_TO_SPECS[gpu_model].copy()
         specs["name"] = gpu_model
         return specs
-    else:
-        print(f"Warning: GPU model '{gpu_model}' not found in GPU_MODEL_TO_SPECS")
-        print("Available GPU models: " + ", ".join(GPU_MODEL_TO_SPECS.keys()))
-        print("Using default RTX 4000 Ada specs - please update GPU_MODEL_TO_SPECS")
-        return {
-            "name": gpu_model,
-            "peak_compute_tflops": 26.7,
-            "peak_compute_tflops_tc": 106.91,
-            "tensor_tflops_datasheet": 327.6,
-            "peak_bandwidth_gb_s": 360.0,
-            "ridge_ai": 26.7e3 / 360.0,
-            "ridge_ai_tc": 106.91e3 / 360.0,
-        }
+
+    print(f"Warning: GPU model '{gpu_model}' not found in GPU_MODEL_TO_SPECS")
+    print("Available GPU models: " + ", ".join(GPU_MODEL_TO_SPECS.keys()))
+    print("Using default RTX 4000 Ada specs - please update GPU_MODEL_TO_SPECS")
+    return {
+        "name": gpu_model,
+        "peak_compute_tflops": 26.7,
+        "peak_compute_tflops_tc": 106.91,
+        "tensor_tflops_datasheet": 327.6,
+        "peak_bandwidth_gb_s": 360.0,
+        "ridge_ai": 26.7e3 / 360.0,
+        "ridge_ai_tc": 106.91e3 / 360.0,
+    }
 
 
 def _get_default_trace_dir() -> Path:
@@ -76,7 +76,8 @@ def _get_default_trace_dir() -> Path:
 def generate_roofline_plot(
     results: dict,
     pass_type: str = "fwd",
-    gpu_model: str = None,
+    gpu_model: str | None = None,
+    dtype: str | None = None,
     output_path: Path | None = None,
 ):
     """Generate roofline plot for forward or backward pass.
@@ -85,13 +86,25 @@ def generate_roofline_plot(
         results: Dict with 'sequence_lengths', 'naive', 'flash', 'cudnn' data
         pass_type: "fwd" for forward pass, "bwd" for backward pass
         gpu_model: GPU model name (e.g., "NVIDIA RTX 4000 Ada")
+        dtype: Data type ("float16" or "float32") - determines which ridge to show
         output_path: Path to save PNG plot
     """
     if gpu_model is None:
         gpu_model = os.environ.get("GPU_MODEL", "NVIDIA RTX 4000 Ada")
 
+    if dtype is None:
+        dtype = results.get("config", {}).get("dtype", "float16")
+
     gpu = get_gpu_specs(gpu_model)
     pass_name = "Forward" if pass_type == "fwd" else "Backward"
+
+    # Determine which ridge to use based on dtype
+    if dtype == "float32":
+        ridge_ai = gpu['ridge_ai']
+        ridge_label = "Ridge (FP32)"
+    else:
+        ridge_ai = gpu['ridge_ai_tc']
+        ridge_label = "Ridge (BF16/FP16)"
 
     seq_lengths = np.array(results["sequence_lengths"])
 
@@ -109,7 +122,6 @@ def generate_roofline_plot(
     # Determine axis range based on actual data
     all_ai = np.concatenate([naive_ai, flash_ai, cudnn_ai])
     all_perf = np.concatenate([naive_perf, flash_perf, cudnn_perf])
-    ridge_ai = gpu['ridge_ai']
     ai_min = min(all_ai.min(), ridge_ai) / 2
     ai_max = max(all_ai.max(), ridge_ai) * 2
 
@@ -119,17 +131,20 @@ def generate_roofline_plot(
     # Memory roof (diagonal)
     memory_roof = gpu["peak_bandwidth_gb_s"] * ai_range
 
-    # Compute roofs (horizontal) - show both FP32 and FP16 Tensor Core peaks
-    compute_roof_fp32 = gpu["peak_compute_tflops"] * 1000 * np.ones_like(ai_range)
-    compute_roof_tc = gpu["peak_compute_tflops_tc"] * 1000 * np.ones_like(ai_range)
+    # Compute roof (horizontal) - use appropriate peak based on dtype
+    if dtype == "float32":
+        compute_roof = gpu["peak_compute_tflops"] * 1000 * np.ones_like(ai_range)
+        compute_label = f'FP32 roof ({gpu["peak_compute_tflops"]:.1f} TFLOP/s)'
+    else:
+        compute_roof = gpu["peak_compute_tflops_tc"] * 1000 * np.ones_like(ai_range)
+        compute_label = f'FP16 TC roof ({gpu["peak_compute_tflops_tc"]:.1f} TFLOP/s)'
 
-    # Cap memory roof at FP16 TC compute roof
-    memory_roof = np.minimum(memory_roof, compute_roof_tc)
+    # Cap memory roof at compute roof
+    memory_roof = np.minimum(memory_roof, compute_roof)
 
     # Plot roofs
     ax.plot(ai_range, memory_roof, 'k--', linewidth=2, alpha=0.7, label='Memory roof')
-    ax.plot(ai_range, compute_roof_fp32, 'r--', linewidth=2, alpha=0.7, label=f'FP32 roof ({gpu["peak_compute_tflops"]:.1f} TFLOP/s)')
-    ax.plot(ai_range, compute_roof_tc, 'g--', linewidth=2, alpha=0.7, label=f'FP16 TC roof ({gpu["peak_compute_tflops_tc"]:.1f} TFLOP/s)')
+    ax.plot(ai_range, compute_roof, 'r--', linewidth=2, alpha=0.7, label=compute_label)
 
     # Plot actual performance
     ax.scatter(naive_ai, naive_perf, marker='o', s=150, c='red',
@@ -158,9 +173,8 @@ def generate_roofline_plot(
 
     # Ridge point annotation
     ridge_perf_fp32 = gpu["peak_compute_tflops"] * 1000
-    ridge_ai = gpu['ridge_ai']
     ax.axvline(ridge_ai, color='gray', linestyle=':', alpha=0.5)
-    ax.text(ridge_ai, ridge_perf_fp32 * 0.1, f'  Ridge\n  AI={ridge_ai:.1f}',
+    ax.text(ridge_ai, ridge_perf_fp32 * 0.1, f'  {ridge_label}\n  AI={ridge_ai:.1f}',
             fontsize=10, rotation=90, va='bottom', ha='right')
 
     # Region annotations
@@ -181,10 +195,10 @@ def generate_roofline_plot(
     # Set axis limits based on data range
     ax.set_xlim(ai_min, ai_max)
     perf_min = all_perf.min() / 2
-    perf_max = max(all_perf.max(), ridge_perf_fp32, compute_roof_tc[0]) * 1.5
+    perf_max = max(all_perf.max(), compute_roof[0]) * 1.5
     ax.set_ylim(perf_min, perf_max)
 
-    ax.set_title(f'Roofline Analysis ({pass_name} Pass): Naive vs Flash (Pallas) vs cuDNN\n{gpu["name"]}',
+    ax.set_title(f'Roofline Analysis ({pass_name} Pass, {dtype.upper()}): Naive vs Flash (Pallas) vs cuDNN\n{gpu["name"]}',
                  fontsize=14, fontweight='bold')
     ax.grid(True, alpha=0.3)
     ax.legend(loc='lower right', fontsize=11)
@@ -252,11 +266,12 @@ def main():
 
     # Print configuration
     config = results.get("config", {})
+    dtype = config.get('dtype', 'float16')
     print(f"\nConfiguration:")
     print(f"  Batch size:      {config.get('B', 'N/A')}")
     print(f"  Number of heads: {config.get('H', 'N/A')}")
     print(f"  Head dimension:  {config.get('D', 'N/A')}")
-    print(f"  Data type:       {config.get('dtype', 'N/A')}")
+    print(f"  Data type:       {dtype}")
     print(f"  Sequence lengths: {results.get('sequence_lengths', [])}")
 
     # Determine output directory
@@ -273,14 +288,26 @@ def main():
 
     output_paths = []
 
+    # Extract timestamp from JSON filename (everything after "roofline_data_{gpu_model}_")
+    stem = json_path.stem
+    prefix = f"roofline_data_{gpu_model.replace(' ', '_')}_"
+    if stem.startswith(prefix):
+        timestamp = stem[len(prefix):]
+    else:
+        # Fallback: try to extract timestamp from end of filename (pattern: YYYYMMDD_HHMMSS)
+        parts = stem.split("_")
+        timestamp = "_".join(parts[-2:]) if len(parts) >= 2 else datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    gpu_filename_safe = gpu_model.replace(" ", "_").replace("/", "_")
+
     if not args.backward_only:
-        fwd_plot_path = output_dir / json_path.stem.replace("roofline_data_", f"roofline_fwd_{gpu_model.replace(' ', '_')}.png")
-        fwd_plot_path = generate_roofline_plot(results, pass_type="fwd", gpu_model=gpu_model, output_path=fwd_plot_path)
+        fwd_plot_path = output_dir / f"roofline_fwd_{gpu_filename_safe}_{timestamp}.png"
+        fwd_plot_path = generate_roofline_plot(results, pass_type="fwd", gpu_model=gpu_model, dtype=dtype, output_path=fwd_plot_path)
         output_paths.append(fwd_plot_path)
 
     if not args.forward_only:
-        bwd_plot_path = output_dir / json_path.stem.replace("roofline_data_", f"roofline_bwd_{gpu_model.replace(' ', '_')}.png")
-        bwd_plot_path = generate_roofline_plot(results, pass_type="bwd", gpu_model=gpu_model, output_path=bwd_plot_path)
+        bwd_plot_path = output_dir / f"roofline_bwd_{gpu_filename_safe}_{timestamp}.png"
+        bwd_plot_path = generate_roofline_plot(results, pass_type="bwd", gpu_model=gpu_model, dtype=dtype, output_path=bwd_plot_path)
         output_paths.append(bwd_plot_path)
 
     print("\n" + "=" * 70)
