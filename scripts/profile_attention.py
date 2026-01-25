@@ -12,8 +12,9 @@ Usage:
 
 import argparse
 import os
-import sys
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
@@ -28,6 +29,9 @@ from high_performance_jax.profiling import (
     get_trace_dir,
 )
 from high_performance_jax.pallas.pallas_flash_attn import flash_attention, mha_reference, cudnn_attention
+
+# Load environment variables from .env file
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 
 def profile_attention(B: int, H: int, T: int, D: int, dtype=jnp.float16):

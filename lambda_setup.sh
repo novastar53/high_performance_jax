@@ -11,6 +11,16 @@ else
     export GPU_MODEL="none"
 fi
 
+# Create .env file with environment variables and source line
+cat > .env << EOF
+# Source UV environment
+source $HOME/.local/bin/env
+
+# GPU model detected by nvidia-smi
+GPU_MODEL="$GPU_MODEL"
+EOF
+echo "Environment variables saved to .env file"
+
 rm -rf .venv
 curl -LsSf https://astral.sh/uv/install.sh | sh
 source $HOME/.local/bin/env

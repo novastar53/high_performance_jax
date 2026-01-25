@@ -14,9 +14,12 @@ import sys
 import argparse
 import json
 import os
+import re
 import time
 from datetime import datetime
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 import jax
 import jax.numpy as jnp
@@ -32,6 +35,9 @@ from high_performance_jax.profiling import (
     _get_trace_path,
     _get_default_trace_dir,
 )
+
+# Load environment variables from .env file
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 # Check backend and set interpret mode for CPU
 if jax.default_backend() == 'cpu':
