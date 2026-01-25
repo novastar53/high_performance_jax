@@ -192,7 +192,9 @@ def benchmark_attention(
 
     Returns:
         Dict with 'naive', 'flash', and 'cudnn' results containing:
-        - time_ms: average execution time
+        - time_ms: average execution time (fwd + bwd)
+        - fwd_time_ms: forward pass time
+        - bwd_time_ms: backward pass time
         - gflops_s: achieved GFLOPs/s
         - ai: arithmetic intensity (FLOPs/byte)
         - bw_gb_s: effective bandwidth
@@ -215,113 +217,89 @@ def benchmark_attention(
     bytes_naive = calculate_bytes_naive(B, H, T, D, bytes_per_elem)
     bytes_flash = calculate_bytes_flash(B, H, T, D, bytes_per_elem)
 
-    # Time naive MHA
-    def ref_loss(q, k, v):
-        return jnp.sum(mha_reference(q, k, v) * do)
+    def _bench(fn, warmup=warmup_iters, iters=profile_iters):
+        """Benchmark a function, return median time in seconds."""
+        for _ in range(warmup):
+            out = fn()
+            jax.block_until_ready(out)
+        times = []
+        for _ in range(iters):
+            t0 = time.perf_counter()
+            out = fn()
+            jax.block_until_ready(out)
+            times.append(time.perf_counter() - t0)
+        return np.median(times)
 
-    ref_fwd_bwd = jax.jit(jax.value_and_grad(ref_loss, argnums=(0, 1, 2)))
+    # Create jitted forward functions
+    naive_fwd = jax.jit(mha_reference)
+    flash_fwd = jax.jit(flash_attention)
+    cudnn_fwd = jax.jit(cudnn_attention)
 
-    # Warm up naive
-    print("  Warming up naive MHA...")
-    for _ in range(warmup_iters):
-        _, grads = ref_fwd_bwd(q, k, v)
-        jax.block_until_ready(grads)
+    # Get vjp functions for backward pass
+    print("  Warming up and timing naive MHA...")
+    _, naive_vjp = jax.vjp(mha_reference, q, k, v)
+    naive_fwd_time = _bench(lambda: naive_fwd(q, k, v))
+    naive_bwd_time = _bench(lambda: naive_vjp(do))
+    naive_time_s = naive_fwd_time + naive_bwd_time
 
-    # Time naive MHA (more iterations for accuracy)
-    print("  Timing naive MHA...")
-    naive_times = []
-    for _ in range(profile_iters):
-        t0 = time.perf_counter()
-        _, grads = ref_fwd_bwd(q, k, v)
-        jax.block_until_ready(grads)
-        naive_times.append(time.perf_counter() - t0)
+    print("  Warming up and timing flash attention...")
+    _, flash_vjp = jax.vjp(flash_attention, q, k, v)
+    flash_fwd_time = _bench(lambda: flash_fwd(q, k, v))
+    flash_bwd_time = _bench(lambda: flash_vjp(do))
+    flash_time_s = flash_fwd_time + flash_bwd_time
 
-    # Use median for robustness (ignore outliers)
-    naive_time_s = np.median(naive_times)
+    print("  Warming up and timing cuDNN attention...")
+    _, cudnn_vjp = jax.vjp(cudnn_attention, q, k, v)
+    cudnn_fwd_time = _bench(lambda: cudnn_fwd(q, k, v))
+    cudnn_bwd_time = _bench(lambda: cudnn_vjp(do))
+    cudnn_time_s = cudnn_fwd_time + cudnn_bwd_time
+
+    # Calculate metrics
     naive_time_ms = naive_time_s * 1000
     naive_gflops_s = flops_naive / (naive_time_s * 1e9)
     naive_ai = flops_naive / bytes_naive
     naive_bw_gb_s = bytes_naive / (naive_time_s * 1e9)
 
-    # Time flash attention (our Pallas implementation)
-    def flash_loss(q, k, v):
-        return jnp.sum(flash_attention(q, k, v) * do)
-
-    flash_fwd_bwd = jax.jit(jax.value_and_grad(flash_loss, argnums=(0, 1, 2)))
-
-    # Warm up flash attention
-    print("  Warming up flash attention...")
-    for _ in range(warmup_iters):
-        _, grads = flash_fwd_bwd(q, k, v)
-        jax.block_until_ready(grads)
-
-    # Time flash attention (more iterations for accuracy)
-    print("  Timing flash attention...")
-    flash_times = []
-    for _ in range(profile_iters):
-        t0 = time.perf_counter()
-        _, grads = flash_fwd_bwd(q, k, v)
-        jax.block_until_ready(grads)
-        flash_times.append(time.perf_counter() - t0)
-
-    # Use median for robustness (ignore outliers)
-    flash_time_s = np.median(flash_times)
     flash_time_ms = flash_time_s * 1000
     flash_gflops_s = flops_pallas / (flash_time_s * 1e9)
     flash_ai = flops_pallas / bytes_flash
     flash_bw_gb_s = bytes_flash / (flash_time_s * 1e9)
 
-    # Time cuDNN attention (jax.nn.dot_product_attention)
-    def cudnn_loss(q, k, v):
-        return jnp.sum(cudnn_attention(q, k, v) * do)
-
-    cudnn_fwd_bwd = jax.jit(jax.value_and_grad(cudnn_loss, argnums=(0, 1, 2)))
-
-    # Warm up cuDNN attention
-    print("  Warming up cuDNN attention...")
-    for _ in range(warmup_iters):
-        _, grads = cudnn_fwd_bwd(q, k, v)
-        jax.block_until_ready(grads)
-
-    # Time cuDNN attention
-    print("  Timing cuDNN attention...")
-    cudnn_times = []
-    for _ in range(profile_iters):
-        t0 = time.perf_counter()
-        _, grads = cudnn_fwd_bwd(q, k, v)
-        jax.block_until_ready(grads)
-        cudnn_times.append(time.perf_counter() - t0)
-
-    cudnn_time_s = np.median(cudnn_times)
     cudnn_time_ms = cudnn_time_s * 1000
     cudnn_gflops_s = flops_cudnn / (cudnn_time_s * 1e9)
-    cudnn_ai = flops_cudnn / bytes_flash  # cuDNN uses flash attention, same memory pattern
+    cudnn_ai = flops_cudnn / bytes_flash
     cudnn_bw_gb_s = bytes_flash / (cudnn_time_s * 1e9)
 
     speedup_flash = naive_time_ms / flash_time_ms
     speedup_cudnn = naive_time_ms / cudnn_time_ms
 
-    print(f"  Naive:  {naive_time_ms:.3f} ms, {naive_gflops_s:.2f} GFLOP/s, AI={naive_ai:.1f}")
-    print(f"  Flash:  {flash_time_ms:.3f} ms, {flash_gflops_s:.2f} GFLOP/s, AI={flash_ai:.1f}")
-    print(f"  cuDNN:  {cudnn_time_ms:.3f} ms, {cudnn_gflops_s:.2f} GFLOP/s, AI={cudnn_ai:.1f}")
+    print(f"  Naive:  {naive_fwd_time*1000:.3f} + {naive_bwd_time*1000:.3f} = {naive_time_ms:.3f} ms, {naive_gflops_s:.2f} GFLOP/s, AI={naive_ai:.1f}")
+    print(f"  Flash:  {flash_fwd_time*1000:.3f} + {flash_bwd_time*1000:.3f} = {flash_time_ms:.3f} ms, {flash_gflops_s:.2f} GFLOP/s, AI={flash_ai:.1f}")
+    print(f"  cuDNN:  {cudnn_fwd_time*1000:.3f} + {cudnn_bwd_time*1000:.3f} = {cudnn_time_ms:.3f} ms, {cudnn_gflops_s:.2f} GFLOP/s, AI={cudnn_ai:.1f}")
     print(f"  Speedup (flash vs naive): {speedup_flash:.2f}x")
     print(f"  Speedup (cuDNN vs naive): {speedup_cudnn:.2f}x")
 
     return {
         "naive": {
             "time_ms": naive_time_ms,
+            "fwd_time_ms": naive_fwd_time * 1000,
+            "bwd_time_ms": naive_bwd_time * 1000,
             "gflops_s": naive_gflops_s,
             "ai": naive_ai,
             "bw_gb_s": naive_bw_gb_s,
         },
         "flash": {
             "time_ms": flash_time_ms,
+            "fwd_time_ms": flash_fwd_time * 1000,
+            "bwd_time_ms": flash_bwd_time * 1000,
             "gflops_s": flash_gflops_s,
             "ai": flash_ai,
             "bw_gb_s": flash_bw_gb_s,
         },
         "cudnn": {
             "time_ms": cudnn_time_ms,
+            "fwd_time_ms": cudnn_fwd_time * 1000,
+            "bwd_time_ms": cudnn_bwd_time * 1000,
             "gflops_s": cudnn_gflops_s,
             "ai": cudnn_ai,
             "bw_gb_s": cudnn_bw_gb_s,
