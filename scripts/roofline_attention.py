@@ -206,7 +206,7 @@ def calculate_bytes_bwd_flash(B: int, H: int, T: int, D: int, bytes_per_elem: in
 
 def benchmark_attention(
     B: int, H: int, T: int, D: int,
-    dtype=jnp.float16,
+    dtype=jnp.bfloat16,
     warmup_iters: int = 3,
     profile_iters: int = 5,
 ) -> dict:
