@@ -86,7 +86,7 @@ def generate_roofline_plot(
         results: Dict with 'sequence_lengths', 'naive', 'flash', 'cudnn' data
         pass_type: "fwd" for forward pass, "bwd" for backward pass
         gpu_model: GPU model name (e.g., "NVIDIA RTX 4000 Ada")
-        dtype: Data type ("float16" or "float32") - determines which ridge to show
+        dtype: Data type ("bfloat16" or "float32") - determines which ridge to show
         output_path: Path to save PNG plot
     """
     if gpu_model is None:

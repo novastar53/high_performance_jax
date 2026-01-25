@@ -36,7 +36,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
 
-INTERPRET_MODE = True  # Set to False on GPU
+INTERPRET_MODE = False  # Set to False on GPU
 
 BLOCK_R = 64
 BLOCK_C = 64
@@ -106,11 +106,11 @@ def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, sca
         idx = pl.dslice(t * BLOCK_C, BLOCK_C)
         k_blk = plgpu.load(k_ref.at[0, idx, :])
         v_blk = plgpu.load(v_ref.at[0, idx, :])
-        s_blk = pl.dot(q_reg, k_blk, trans_b=True) / scale
+        s_blk = pl.dot(q_reg, k_blk, trans_b=True, precision='float32') / scale
         max_blk = jnp.maximum(max_reg, jnp.max(s_blk, axis=-1))
         s_blk = jnp.exp(s_blk - max_blk[:, None])
         l_blk = jnp.sum(s_blk, axis=-1)
-        o_blk = pl.dot(s_blk, v_blk)
+        o_blk = pl.dot(s_blk.astype(v_blk.dtype), v_blk)
         return (max_blk, 
                 l_reg * jnp.exp(max_reg - max_blk) + l_blk, 
                 o_reg * jnp.exp(max_reg - max_blk)[:, None] + o_blk)
@@ -237,8 +237,8 @@ def flash_attention_bwd_dkv_kernel(
         p_blk = jnp.exp(s_blk - logsumexp_blk[..., None])
         dp_blk = pl.dot(do_blk, v_reg, trans_b=True)
         ds_blk = p_blk * (dp_blk - d_blk[..., None]) / scale
-        dv_acc += pl.dot(p_blk, do_blk, trans_a=True)
-        dk_acc += pl.dot(ds_blk, q_blk, trans_a=True)
+        dv_acc += pl.dot(p_blk.astype(do_blk.dtype), do_blk, trans_a=True)
+        dk_acc += pl.dot(ds_blk.astype(q_blk.dtype), q_blk, trans_a=True)
         return dk_acc, dv_acc
         
     dk_acc, dv_acc = jax.lax.fori_loop(0, num_q_blocks, body, (dk_acc, dv_acc))
@@ -308,7 +308,7 @@ def flash_attention_bwd_dq_kernel(
         p_blk = jnp.exp(s_blk - logsumexp_reg[..., None])
         dp_blk = pl.dot(do_reg, v_blk, trans_b=True)
         ds_blk = p_blk * ( dp_blk - d_reg[..., None] ) / scale
-        dq_acc += pl.dot(ds_blk, k_blk)
+        dq_acc += pl.dot(ds_blk.astype(k_blk.dtype), k_blk)
         return dq_acc
     dq_acc = jax.lax.fori_loop(0, num_kv_blocks, body, dq_acc)
     plgpu.store(dq_ref, dq_acc.astype(dq_ref.dtype))
@@ -462,7 +462,7 @@ if __name__ == "__main__":
 
     # Use larger sizes for meaningful timing
     # Use bfloat16 for cuDNN compatibility
-    B_bench, H_bench, T_bench, D_bench = 4, 8, 2048, 64
+    B_bench, H_bench, T_bench, D_bench = 4, 8, 4096, 64
     q_bench = jax.random.normal(keys[0], (B_bench, H_bench, T_bench, D_bench), dtype=DTYPE)
     k_bench = jax.random.normal(keys[1], (B_bench, H_bench, T_bench, D_bench), dtype=DTYPE)
     v_bench = jax.random.normal(keys[2], (B_bench, H_bench, T_bench, D_bench), dtype=DTYPE)

@@ -86,15 +86,7 @@ def get_gpu_specs(gpu_model: str) -> dict:
     print(f"Warning: GPU model '{gpu_model}' not found in GPU_MODEL_TO_SPECS")
     print("Available GPU models: " + ", ".join(GPU_MODEL_TO_SPECS.keys()))
     print("Using default RTX 4000 Ada specs - please update GPU_MODEL_TO_SPECS")
-    return {
-        "name": gpu_model,
-        "peak_compute_tflops": 26.7,
-        "peak_compute_tflops_tc": 106.91,
-        "tensor_tflops_datasheet": 327.6,
-        "peak_bandwidth_gb_s": 360.0,
-        "ridge_ai": 26.7e3 / 360.0,
-        "ridge_ai_tc": 106.91e3 / 360.0,
-    }
+    return GPU_MODEL_TO_SPECS["NVIDIA RTX 4000 Ada Generation"]
 
 
 def calculate_flops_fwd(B: int, H: int, T: int, D: int) -> float:
@@ -339,14 +331,14 @@ def generate_roofline_plot(
         results: Dict with 'sequence_lengths', 'naive', 'flash', 'cudnn' data
         pass_type: "fwd" for forward pass, "bwd" for backward pass
         gpu_model: GPU model name (e.g., "NVIDIA RTX 4000 Ada")
-        dtype: Data type ("float16" or "float32") - determines which ridge to show
+        dtype: Data type ("bfloat16" or "float32") - determines which ridge to show
         output_path: Path to save PNG plot
     """
     if gpu_model is None:
         gpu_model = os.environ.get("GPU_MODEL", "NVIDIA RTX 4000 Ada")
 
     if dtype is None:
-        dtype = results.get("config", {}).get("dtype", "float16")
+        dtype = results.get("config", {}).get("dtype", "bfloat16")
 
     gpu = get_gpu_specs(gpu_model)
     pass_name = "Forward" if pass_type == "fwd" else "Backward"
@@ -491,8 +483,8 @@ def main():
     parser.add_argument("--head-dim", type=int, default=64, help="Head dimension")
     parser.add_argument("--seq-lengths", type=str, default="128,256,512,1024,2048,4096",
                        help="Comma-separated sequence lengths (x2 scaling)")
-    parser.add_argument("--dtype", type=str, default="float16",
-                       choices=["float16", "float32"], help="Data type")
+    parser.add_argument("--dtype", type=str, default="bfloat16",
+                       choices=["bfloat16", "float32"], help="Data type")
     parser.add_argument("--warmup", type=int, default=3, help="Warmup iterations")
     parser.add_argument("--iters", type=int, default=5, help="Profile iterations")
     parser.add_argument("--trace-dir", type=str, default=None, help="Directory for outputs")
@@ -508,7 +500,7 @@ def main():
     gpu_model = os.environ.get("GPU_MODEL", "NVIDIA RTX 4000 Ada")
     print(f"GPU Model: {gpu_model}")
 
-    dtype = jnp.float16 if args.dtype == "float16" else jnp.float32
+    dtype = jnp.bfloat16 if args.dtype == "bfloat16" else jnp.float32
     seq_lengths = [int(x) for x in args.seq_lengths.split(",")]
 
     print("=" * 70)
