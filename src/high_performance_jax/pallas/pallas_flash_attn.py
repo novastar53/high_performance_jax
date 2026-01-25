@@ -29,6 +29,7 @@ from functools import partial
 
 import math
 
+import numpy as np
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
@@ -503,7 +504,7 @@ if __name__ == "__main__":
             out = fn()
             jax.block_until_ready(out)
             times.append(time.perf_counter() - t0)
-        return sum(times) / len(times) * 1000  # ms
+        return np.median(times) * 1000
 
     # Create jitted forward functions
     jax_fwd = jax.jit(cudnn_attention)
