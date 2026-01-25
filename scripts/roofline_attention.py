@@ -75,7 +75,7 @@ GPU_SPECS = {
 
 
 def calculate_flops_fwd(B: int, H: int, T: int, D: int) -> float:
-    """Calculate FLOPs for forward attention only.
+    """Calculate FLOPs for forward attention (same for all implementations).
 
     Forward:
     - Q @ K.T: B*H*T*T*D * 2 (mult + add per element)
@@ -88,98 +88,97 @@ def calculate_flops_fwd(B: int, H: int, T: int, D: int) -> float:
     return fwd_matmul + fwd_softmax
 
 
-def calculate_flops_pallas(B: int, H: int, T: int, D: int) -> float:
-    """Calculate FLOPs for Pallas flash attention (forward + backward).
+def calculate_flops_bwd_naive(B: int, H: int, T: int, D: int) -> float:
+    """Calculate backward FLOPs for naive attention.
+
+    Naive attention stores the full attention matrix, so backward doesn't
+    need to recompute. Uses standard autodiff.
+    - dV = P^T @ dO: 2*T²*D
+    - dP = dO @ V^T: 2*T²*D
+    - dQ = dS @ K: 2*T²*D
+    - dK = dS^T @ Q: 2*T²*D
+    Total: ~8*B*H*T^2*D
+    """
+    return 8 * B * H * T * T * D
+
+
+def calculate_flops_bwd_pallas(B: int, H: int, T: int, D: int) -> float:
+    """Calculate backward FLOPs for Pallas flash attention.
 
     Our Pallas implementation recomputes attention twice in backward:
     - dKV kernel: recomputes S = Q @ K^T, computes dP, dV, dK (4 matmuls)
     - dQ kernel: recomputes S = Q @ K^T, computes dP, dQ (3 matmuls)
-    Total backward: ~14*B*H*T^2*D
-
-    Total: ~18*B*H*T^2*D (forward + backward)
+    Total: ~14*B*H*T^2*D
     """
-    total_fwd = calculate_flops_fwd(B, H, T, D)
-
-    # Backward pass with flash attention recomputation (our implementation)
     bwd_dkv = 8 * B * H * T * T * D   # S recompute + dP + dV + dK
     bwd_dq = 6 * B * H * T * T * D    # S recompute + dP + dQ
-    total_bwd = bwd_dkv + bwd_dq
-
-    return total_fwd + total_bwd
+    return bwd_dkv + bwd_dq
 
 
-def calculate_flops_cudnn(B: int, H: int, T: int, D: int) -> float:
-    """Calculate FLOPs for cuDNN flash attention (forward + backward).
+def calculate_flops_bwd_cudnn(B: int, H: int, T: int, D: int) -> float:
+    """Calculate backward FLOPs for cuDNN flash attention.
 
     cuDNN uses optimized backward that recomputes attention only once:
     - Single fused backward: recomputes S once, computes dQ, dK, dV
-    Total backward: ~10*B*H*T^2*D
-
-    Total: ~14*B*H*T^2*D (forward + backward)
+    Total: ~10*B*H*T^2*D
     """
-    total_fwd = calculate_flops_fwd(B, H, T, D)
-
-    # cuDNN backward - more efficient, recomputes once
-    # S recompute: 2*T²*D, dP: 2*T²*D, dV: 2*T²*D, dQ: 2*T²*D, dK: 2*T²*D
-    total_bwd = 10 * B * H * T * T * D
-
-    return total_fwd + total_bwd
+    return 10 * B * H * T * T * D
 
 
-def calculate_flops_naive(B: int, H: int, T: int, D: int) -> float:
-    """Calculate FLOPs for naive attention (forward + backward).
-
-    Naive attention stores the full attention matrix, so backward doesn't
-    need to recompute. Uses standard autodiff.
-
-    Forward: 4*B*H*T^2*D
-    Backward: ~8*B*H*T^2*D (dV, dP, dQ, dK matmuls)
-    Total: ~12*B*H*T^2*D
-    """
-    total_fwd = calculate_flops_fwd(B, H, T, D)
-
-    # Standard backward with stored attention matrix
-    total_bwd = 8 * B * H * T * T * D
-
-    return total_fwd + total_bwd
-
-
-def calculate_bytes_naive(B: int, H: int, T: int, D: int, bytes_per_elem: int = 4) -> float:
-    """Calculate bytes transferred for naive MHA (fwd+bwd).
+def calculate_bytes_fwd_naive(B: int, H: int, T: int, D: int, bytes_per_elem: int = 2) -> float:
+    """Calculate bytes transferred for naive MHA forward pass.
 
     Naive MHA materializes full attention matrix:
-    - Q, K, V (input): B*H*T*D * 3 * bytes_per_elem
-    - Attention matrix (T×T): B*H*T*T * bytes_per_elem  <-- THE BIG ONE
-    - Output O: B*H*T*D * bytes_per_elem
-
-    Backward: similar traffic plus gradients, approximately 2x forward
+    - Read Q, K, V: B*H*T*D * 3
+    - Write attention matrix: B*H*T*T  <-- THE BIG ONE
+    - Write output O: B*H*T*D
     """
-    fwd_bytes = (
-        B * H * T * D * 3 * bytes_per_elem +  # Q, K, V
-        B * H * T * T * bytes_per_elem +       # Attention matrix
-        B * H * T * D * bytes_per_elem          # Output O
+    return (
+        B * H * T * D * 3 * bytes_per_elem +  # Q, K, V read
+        B * H * T * T * bytes_per_elem +       # Attention matrix write
+        B * H * T * D * bytes_per_elem          # Output O write
     )
-    # Backward roughly doubles memory traffic (gradients similar size)
-    return fwd_bytes * 2
 
 
-def calculate_bytes_flash(B: int, H: int, T: int, D: int, bytes_per_elem: int = 4) -> float:
-    """Calculate bytes transferred for flash attention (fwd+bwd).
+def calculate_bytes_bwd_naive(B: int, H: int, T: int, D: int, bytes_per_elem: int = 2) -> float:
+    """Calculate bytes transferred for naive MHA backward pass.
+
+    - Read Q, K, V, O, dO, attention matrix: lots of traffic
+    - Write dQ, dK, dV: B*H*T*D * 3
+    """
+    return (
+        B * H * T * D * 5 * bytes_per_elem +  # Q, K, V, O, dO read
+        B * H * T * T * bytes_per_elem +       # Attention matrix read
+        B * H * T * D * 3 * bytes_per_elem     # dQ, dK, dV write
+    )
+
+
+def calculate_bytes_fwd_flash(B: int, H: int, T: int, D: int, bytes_per_elem: int = 2) -> float:
+    """Calculate bytes transferred for flash attention forward pass.
 
     Flash attention computes in tiles, only stores logsumexp:
-    - Q, K, V (input): B*H*T*D * 3 * bytes_per_elem
-    - logsumexp: B*H*T * bytes_per_elem  <-- TINY RESIDUAL
-    - Output O: B*H*T*D * bytes_per_elem
-
-    Backward: similar traffic plus gradients, approximately 2x forward
+    - Read Q, K, V: B*H*T*D * 3
+    - Write logsumexp: B*H*T  <-- TINY
+    - Write output O: B*H*T*D
     """
-    fwd_bytes = (
-        B * H * T * D * 3 * bytes_per_elem +  # Q, K, V
-        B * H * T * bytes_per_elem +             # logsumexp
-        B * H * T * D * bytes_per_elem            # Output O
+    return (
+        B * H * T * D * 3 * bytes_per_elem +  # Q, K, V read
+        B * H * T * bytes_per_elem +           # logsumexp write
+        B * H * T * D * bytes_per_elem          # Output O write
     )
-    # Backward roughly doubles memory traffic (gradients similar size)
-    return fwd_bytes * 2
+
+
+def calculate_bytes_bwd_flash(B: int, H: int, T: int, D: int, bytes_per_elem: int = 2) -> float:
+    """Calculate bytes transferred for flash attention backward pass.
+
+    - Read Q, K, V, O, dO, logsumexp
+    - Write dQ, dK, dV
+    """
+    return (
+        B * H * T * D * 5 * bytes_per_elem +  # Q, K, V, O, dO read
+        B * H * T * bytes_per_elem +           # logsumexp read
+        B * H * T * D * 3 * bytes_per_elem     # dQ, dK, dV write
+    )
 
 
 def benchmark_attention(
@@ -191,13 +190,8 @@ def benchmark_attention(
     """Benchmark a single configuration.
 
     Returns:
-        Dict with 'naive', 'flash', and 'cudnn' results containing:
-        - time_ms: average execution time (fwd + bwd)
-        - fwd_time_ms: forward pass time
-        - bwd_time_ms: backward pass time
-        - gflops_s: achieved GFLOPs/s
-        - ai: arithmetic intensity (FLOPs/byte)
-        - bw_gb_s: effective bandwidth
+        Dict with 'naive', 'flash', and 'cudnn' results containing separate
+        forward and backward metrics (time, gflops_s, ai, bw_gb_s).
     """
     print(f"\nBenchmarking: B={B}, H={H}, T={T}, D={D}")
 
@@ -208,14 +202,24 @@ def benchmark_attention(
     v = jax.random.normal(keys[2], (B, H, T, D), dtype=dtype)
     do = jax.random.normal(keys[3], (B, H, T, D), dtype=dtype)
 
-    # Calculate FLOPs and bytes for this configuration
-    # Each implementation has different FLOP counts due to different backward algorithms
+    # Calculate FLOPs and bytes for this configuration (separate fwd/bwd)
     bytes_per_elem = 2 if dtype == jnp.float16 else 4
-    flops_naive = calculate_flops_naive(B, H, T, D)
-    flops_pallas = calculate_flops_pallas(B, H, T, D)
-    flops_cudnn = calculate_flops_cudnn(B, H, T, D)
-    bytes_naive = calculate_bytes_naive(B, H, T, D, bytes_per_elem)
-    bytes_flash = calculate_bytes_flash(B, H, T, D, bytes_per_elem)
+
+    # Forward FLOPs (same for all implementations)
+    flops_fwd = calculate_flops_fwd(B, H, T, D)
+
+    # Backward FLOPs (different per implementation)
+    flops_bwd_naive = calculate_flops_bwd_naive(B, H, T, D)
+    flops_bwd_pallas = calculate_flops_bwd_pallas(B, H, T, D)
+    flops_bwd_cudnn = calculate_flops_bwd_cudnn(B, H, T, D)
+
+    # Forward bytes
+    bytes_fwd_naive = calculate_bytes_fwd_naive(B, H, T, D, bytes_per_elem)
+    bytes_fwd_flash = calculate_bytes_fwd_flash(B, H, T, D, bytes_per_elem)
+
+    # Backward bytes
+    bytes_bwd_naive = calculate_bytes_bwd_naive(B, H, T, D, bytes_per_elem)
+    bytes_bwd_flash = calculate_bytes_bwd_flash(B, H, T, D, bytes_per_elem)
 
     def _bench(fn, warmup=warmup_iters, iters=profile_iters):
         """Benchmark a function, return median time in seconds."""
@@ -235,101 +239,96 @@ def benchmark_attention(
     flash_fwd = jax.jit(flash_attention)
     cudnn_fwd = jax.jit(cudnn_attention)
 
-    # Get vjp functions for backward pass
+    # Get vjp functions for backward pass and benchmark
     print("  Warming up and timing naive MHA...")
     _, naive_vjp = jax.vjp(mha_reference, q, k, v)
     naive_fwd_time = _bench(lambda: naive_fwd(q, k, v))
     naive_bwd_time = _bench(lambda: naive_vjp(do))
-    naive_time_s = naive_fwd_time + naive_bwd_time
 
     print("  Warming up and timing flash attention...")
     _, flash_vjp = jax.vjp(flash_attention, q, k, v)
     flash_fwd_time = _bench(lambda: flash_fwd(q, k, v))
     flash_bwd_time = _bench(lambda: flash_vjp(do))
-    flash_time_s = flash_fwd_time + flash_bwd_time
 
     print("  Warming up and timing cuDNN attention...")
     _, cudnn_vjp = jax.vjp(cudnn_attention, q, k, v)
     cudnn_fwd_time = _bench(lambda: cudnn_fwd(q, k, v))
     cudnn_bwd_time = _bench(lambda: cudnn_vjp(do))
-    cudnn_time_s = cudnn_fwd_time + cudnn_bwd_time
 
-    # Calculate metrics
-    naive_time_ms = naive_time_s * 1000
-    naive_gflops_s = flops_naive / (naive_time_s * 1e9)
-    naive_ai = flops_naive / bytes_naive
-    naive_bw_gb_s = bytes_naive / (naive_time_s * 1e9)
+    # Calculate metrics for each pass
+    def calc_metrics(time_s, flops, bytes_transferred):
+        return {
+            "time_ms": time_s * 1000,
+            "gflops_s": flops / (time_s * 1e9),
+            "ai": flops / bytes_transferred,
+            "bw_gb_s": bytes_transferred / (time_s * 1e9),
+        }
 
-    flash_time_ms = flash_time_s * 1000
-    flash_gflops_s = flops_pallas / (flash_time_s * 1e9)
-    flash_ai = flops_pallas / bytes_flash
-    flash_bw_gb_s = bytes_flash / (flash_time_s * 1e9)
+    naive_fwd_metrics = calc_metrics(naive_fwd_time, flops_fwd, bytes_fwd_naive)
+    naive_bwd_metrics = calc_metrics(naive_bwd_time, flops_bwd_naive, bytes_bwd_naive)
+    flash_fwd_metrics = calc_metrics(flash_fwd_time, flops_fwd, bytes_fwd_flash)
+    flash_bwd_metrics = calc_metrics(flash_bwd_time, flops_bwd_pallas, bytes_bwd_flash)
+    cudnn_fwd_metrics = calc_metrics(cudnn_fwd_time, flops_fwd, bytes_fwd_flash)
+    cudnn_bwd_metrics = calc_metrics(cudnn_bwd_time, flops_bwd_cudnn, bytes_bwd_flash)
 
-    cudnn_time_ms = cudnn_time_s * 1000
-    cudnn_gflops_s = flops_cudnn / (cudnn_time_s * 1e9)
-    cudnn_ai = flops_cudnn / bytes_flash
-    cudnn_bw_gb_s = bytes_flash / (cudnn_time_s * 1e9)
+    # Print results
+    naive_total = naive_fwd_time + naive_bwd_time
+    flash_total = flash_fwd_time + flash_bwd_time
+    cudnn_total = cudnn_fwd_time + cudnn_bwd_time
 
-    speedup_flash = naive_time_ms / flash_time_ms
-    speedup_cudnn = naive_time_ms / cudnn_time_ms
-
-    print(f"  Naive:  {naive_fwd_time*1000:.3f} + {naive_bwd_time*1000:.3f} = {naive_time_ms:.3f} ms, {naive_gflops_s:.2f} GFLOP/s, AI={naive_ai:.1f}")
-    print(f"  Flash:  {flash_fwd_time*1000:.3f} + {flash_bwd_time*1000:.3f} = {flash_time_ms:.3f} ms, {flash_gflops_s:.2f} GFLOP/s, AI={flash_ai:.1f}")
-    print(f"  cuDNN:  {cudnn_fwd_time*1000:.3f} + {cudnn_bwd_time*1000:.3f} = {cudnn_time_ms:.3f} ms, {cudnn_gflops_s:.2f} GFLOP/s, AI={cudnn_ai:.1f}")
-    print(f"  Speedup (flash vs naive): {speedup_flash:.2f}x")
-    print(f"  Speedup (cuDNN vs naive): {speedup_cudnn:.2f}x")
+    print(f"  Naive:  fwd {naive_fwd_metrics['time_ms']:.3f}ms ({naive_fwd_metrics['gflops_s']:.0f} GFLOP/s, AI={naive_fwd_metrics['ai']:.0f}) | "
+          f"bwd {naive_bwd_metrics['time_ms']:.3f}ms ({naive_bwd_metrics['gflops_s']:.0f} GFLOP/s, AI={naive_bwd_metrics['ai']:.0f})")
+    print(f"  Flash:  fwd {flash_fwd_metrics['time_ms']:.3f}ms ({flash_fwd_metrics['gflops_s']:.0f} GFLOP/s, AI={flash_fwd_metrics['ai']:.0f}) | "
+          f"bwd {flash_bwd_metrics['time_ms']:.3f}ms ({flash_bwd_metrics['gflops_s']:.0f} GFLOP/s, AI={flash_bwd_metrics['ai']:.0f})")
+    print(f"  cuDNN:  fwd {cudnn_fwd_metrics['time_ms']:.3f}ms ({cudnn_fwd_metrics['gflops_s']:.0f} GFLOP/s, AI={cudnn_fwd_metrics['ai']:.0f}) | "
+          f"bwd {cudnn_bwd_metrics['time_ms']:.3f}ms ({cudnn_bwd_metrics['gflops_s']:.0f} GFLOP/s, AI={cudnn_bwd_metrics['ai']:.0f})")
+    print(f"  Speedup (flash vs naive): {naive_total/flash_total:.2f}x")
+    print(f"  Speedup (cuDNN vs naive): {naive_total/cudnn_total:.2f}x")
 
     return {
         "naive": {
-            "time_ms": naive_time_ms,
-            "fwd_time_ms": naive_fwd_time * 1000,
-            "bwd_time_ms": naive_bwd_time * 1000,
-            "gflops_s": naive_gflops_s,
-            "ai": naive_ai,
-            "bw_gb_s": naive_bw_gb_s,
+            "fwd": naive_fwd_metrics,
+            "bwd": naive_bwd_metrics,
         },
         "flash": {
-            "time_ms": flash_time_ms,
-            "fwd_time_ms": flash_fwd_time * 1000,
-            "bwd_time_ms": flash_bwd_time * 1000,
-            "gflops_s": flash_gflops_s,
-            "ai": flash_ai,
-            "bw_gb_s": flash_bw_gb_s,
+            "fwd": flash_fwd_metrics,
+            "bwd": flash_bwd_metrics,
         },
         "cudnn": {
-            "time_ms": cudnn_time_ms,
-            "fwd_time_ms": cudnn_fwd_time * 1000,
-            "bwd_time_ms": cudnn_bwd_time * 1000,
-            "gflops_s": cudnn_gflops_s,
-            "ai": cudnn_ai,
-            "bw_gb_s": cudnn_bw_gb_s,
+            "fwd": cudnn_fwd_metrics,
+            "bwd": cudnn_bwd_metrics,
         },
-        "speedup": speedup_flash,
-        "speedup_cudnn": speedup_cudnn,
+        "speedup": naive_total / flash_total,
+        "speedup_cudnn": naive_total / cudnn_total,
     }
 
 
 def generate_roofline_plot(
     results: dict,
+    pass_type: str = "fwd",
     gpu_key: str = "rtx4000-ada",
     output_path: Path | None = None,
 ):
-    """Generate roofline plot.
+    """Generate roofline plot for forward or backward pass.
 
     Args:
         results: Dict with 'sequence_lengths', 'naive', 'flash', 'cudnn' data
+        pass_type: "fwd" for forward pass, "bwd" for backward pass
         gpu_key: Key for GPU specs in GPU_SPECS
         output_path: Path to save PNG plot
     """
     gpu = GPU_SPECS[gpu_key]
+    pass_name = "Forward" if pass_type == "fwd" else "Backward"
 
     seq_lengths = np.array(results["sequence_lengths"])
-    naive_ai = np.array(results["naive"]["ai"])
-    flash_ai = np.array(results["flash"]["ai"])
-    cudnn_ai = np.array(results["cudnn"]["ai"])
-    naive_perf = np.array(results["naive"]["gflops_s"])
-    flash_perf = np.array(results["flash"]["gflops_s"])
-    cudnn_perf = np.array(results["cudnn"]["gflops_s"])
+
+    # Extract metrics for the specified pass
+    naive_ai = np.array([r["ai"] for r in results["naive"][pass_type]])
+    flash_ai = np.array([r["ai"] for r in results["flash"][pass_type]])
+    cudnn_ai = np.array([r["ai"] for r in results["cudnn"][pass_type]])
+    naive_perf = np.array([r["gflops_s"] for r in results["naive"][pass_type]])
+    flash_perf = np.array([r["gflops_s"] for r in results["flash"][pass_type]])
+    cudnn_perf = np.array([r["gflops_s"] for r in results["cudnn"][pass_type]])
 
     # Create figure
     fig, ax = plt.subplots(figsize=(12, 8))
@@ -413,7 +412,7 @@ def generate_roofline_plot(
     perf_max = max(all_perf.max(), ridge_perf) * 1.5
     ax.set_ylim(perf_min, perf_max)
 
-    ax.set_title(f'Roofline Analysis: Naive vs Flash (Pallas) vs cuDNN\n{gpu["name"]}',
+    ax.set_title(f'Roofline Analysis ({pass_name} Pass): Naive vs Flash (Pallas) vs cuDNN\n{gpu["name"]}',
                  fontsize=14, fontweight='bold')
     ax.grid(True, alpha=0.3)
     ax.legend(loc='lower right', fontsize=11)
@@ -424,9 +423,6 @@ def generate_roofline_plot(
         f"  CUDA peak: {gpu['peak_compute_tflops']:.1f} TFLOP/s",
         f"  TC peak: {gpu['peak_compute_tflops_tc']:.1f} TFLOP/s",
         f"  Bandwidth: {gpu['peak_bandwidth_gb_s']:.1f} GB/s",
-        "",
-        "Pallas: ~CUDA-level perf",
-        "cuDNN: full TC throughput",
     ]
     specs_text = "\n".join(specs_text_lines)
 
@@ -438,11 +434,11 @@ def generate_roofline_plot(
     # Save plot
     if output_path is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = _get_default_trace_dir() / f"roofline_plot_{timestamp}.png"
+        output_path = _get_default_trace_dir() / f"roofline_{pass_type}_{timestamp}.png"
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    print(f"\nPlot saved to: {output_path}")
+    print(f"\n{pass_name} pass plot saved to: {output_path}")
 
     return output_path
 
@@ -516,9 +512,9 @@ def main():
             "dtype": args.dtype,
         },
         "sequence_lengths": seq_lengths,
-        "naive": {"time_ms": [], "gflops_s": [], "ai": [], "bw_gb_s": []},
-        "flash": {"time_ms": [], "gflops_s": [], "ai": [], "bw_gb_s": []},
-        "cudnn": {"time_ms": [], "gflops_s": [], "ai": [], "bw_gb_s": []},
+        "naive": {"fwd": [], "bwd": []},
+        "flash": {"fwd": [], "bwd": []},
+        "cudnn": {"fwd": [], "bwd": []},
         "speedups": [],
         "speedups_cudnn": [],
     }
@@ -529,65 +525,82 @@ def main():
             dtype=dtype, warmup_iters=args.warmup, profile_iters=args.iters
         )
 
-        results["naive"]["time_ms"].append(benchmark_result["naive"]["time_ms"])
-        results["naive"]["gflops_s"].append(benchmark_result["naive"]["gflops_s"])
-        results["naive"]["ai"].append(benchmark_result["naive"]["ai"])
-        results["naive"]["bw_gb_s"].append(benchmark_result["naive"]["bw_gb_s"])
-
-        results["flash"]["time_ms"].append(benchmark_result["flash"]["time_ms"])
-        results["flash"]["gflops_s"].append(benchmark_result["flash"]["gflops_s"])
-        results["flash"]["ai"].append(benchmark_result["flash"]["ai"])
-        results["flash"]["bw_gb_s"].append(benchmark_result["flash"]["bw_gb_s"])
-
-        results["cudnn"]["time_ms"].append(benchmark_result["cudnn"]["time_ms"])
-        results["cudnn"]["gflops_s"].append(benchmark_result["cudnn"]["gflops_s"])
-        results["cudnn"]["ai"].append(benchmark_result["cudnn"]["ai"])
-        results["cudnn"]["bw_gb_s"].append(benchmark_result["cudnn"]["bw_gb_s"])
-
+        results["naive"]["fwd"].append(benchmark_result["naive"]["fwd"])
+        results["naive"]["bwd"].append(benchmark_result["naive"]["bwd"])
+        results["flash"]["fwd"].append(benchmark_result["flash"]["fwd"])
+        results["flash"]["bwd"].append(benchmark_result["flash"]["bwd"])
+        results["cudnn"]["fwd"].append(benchmark_result["cudnn"]["fwd"])
+        results["cudnn"]["bwd"].append(benchmark_result["cudnn"]["bwd"])
         results["speedups"].append(benchmark_result["speedup"])
         results["speedups_cudnn"].append(benchmark_result["speedup_cudnn"])
 
-    # Print summary table
-    print("\n" + "=" * 95)
-    print("SUMMARY TABLE")
-    print("=" * 95)
+    # Print summary tables
+    print("\n" + "=" * 120)
+    print("FORWARD PASS SUMMARY")
+    print("=" * 120)
     print(f"{'T':<6} {'Naive':<10} {'Flash':<10} {'cuDNN':<10} "
-          f"{'Naive':<12} {'Flash':<12} {'cuDNN':<12} {'Flash':<8} {'cuDNN':<8}")
+          f"{'Naive':<12} {'Flash':<12} {'cuDNN':<12} "
+          f"{'Naive':<10} {'Flash':<10} {'cuDNN':<10}")
     print(f"{'':<6} {'(ms)':<10} {'(ms)':<10} {'(ms)':<10} "
-          f"{'(GFLOP/s)':<12} {'(GFLOP/s)':<12} {'(GFLOP/s)':<12} {'Speedup':<8} {'Speedup':<8}")
-    print("-" * 95)
+          f"{'(GFLOP/s)':<12} {'(GFLOP/s)':<12} {'(GFLOP/s)':<12} "
+          f"{'(AI)':<10} {'(AI)':<10} {'(AI)':<10}")
+    print("-" * 120)
 
     for i, T in enumerate(seq_lengths):
-        print(f"{T:<6} {results['naive']['time_ms'][i]:<10.3f} "
-              f"{results['flash']['time_ms'][i]:<10.3f} "
-              f"{results['cudnn']['time_ms'][i]:<10.3f} "
-              f"{results['naive']['gflops_s'][i]:<12.2f} "
-              f"{results['flash']['gflops_s'][i]:<12.2f} "
-              f"{results['cudnn']['gflops_s'][i]:<12.2f} "
-              f"{results['speedups'][i]:<8.2f}x "
-              f"{results['speedups_cudnn'][i]:<8.2f}x")
+        print(f"{T:<6} "
+              f"{results['naive']['fwd'][i]['time_ms']:<10.3f} "
+              f"{results['flash']['fwd'][i]['time_ms']:<10.3f} "
+              f"{results['cudnn']['fwd'][i]['time_ms']:<10.3f} "
+              f"{results['naive']['fwd'][i]['gflops_s']:<12.0f} "
+              f"{results['flash']['fwd'][i]['gflops_s']:<12.0f} "
+              f"{results['cudnn']['fwd'][i]['gflops_s']:<12.0f} "
+              f"{results['naive']['fwd'][i]['ai']:<10.0f} "
+              f"{results['flash']['fwd'][i]['ai']:<10.0f} "
+              f"{results['cudnn']['fwd'][i]['ai']:<10.0f}")
+
+    print("\n" + "=" * 120)
+    print("BACKWARD PASS SUMMARY")
+    print("=" * 120)
+    print(f"{'T':<6} {'Naive':<10} {'Flash':<10} {'cuDNN':<10} "
+          f"{'Naive':<12} {'Flash':<12} {'cuDNN':<12} "
+          f"{'Naive':<10} {'Flash':<10} {'cuDNN':<10}")
+    print(f"{'':<6} {'(ms)':<10} {'(ms)':<10} {'(ms)':<10} "
+          f"{'(GFLOP/s)':<12} {'(GFLOP/s)':<12} {'(GFLOP/s)':<12} "
+          f"{'(AI)':<10} {'(AI)':<10} {'(AI)':<10}")
+    print("-" * 120)
+
+    for i, T in enumerate(seq_lengths):
+        print(f"{T:<6} "
+              f"{results['naive']['bwd'][i]['time_ms']:<10.3f} "
+              f"{results['flash']['bwd'][i]['time_ms']:<10.3f} "
+              f"{results['cudnn']['bwd'][i]['time_ms']:<10.3f} "
+              f"{results['naive']['bwd'][i]['gflops_s']:<12.0f} "
+              f"{results['flash']['bwd'][i]['gflops_s']:<12.0f} "
+              f"{results['cudnn']['bwd'][i]['gflops_s']:<12.0f} "
+              f"{results['naive']['bwd'][i]['ai']:<10.0f} "
+              f"{results['flash']['bwd'][i]['ai']:<10.0f} "
+              f"{results['cudnn']['bwd'][i]['ai']:<10.0f}")
 
     avg_speedup = np.mean(results["speedups"])
     avg_speedup_cudnn = np.mean(results["speedups_cudnn"])
-    print(f"\nAverage speedup (flash vs naive):  {avg_speedup:.2f}x")
-    print(f"Average speedup (cuDNN vs naive):  {avg_speedup_cudnn:.2f}x")
+    print(f"\nAverage total speedup (flash vs naive):  {avg_speedup:.2f}x")
+    print(f"Average total speedup (cuDNN vs naive):  {avg_speedup_cudnn:.2f}x")
 
     # Verify GFLOPs/s against peak compute
-    max_flash_gflops = np.max(results["flash"]["gflops_s"])
-    max_cudnn_gflops = np.max(results["cudnn"]["gflops_s"])
+    max_flash_fwd = max(r["gflops_s"] for r in results["flash"]["fwd"])
+    max_flash_bwd = max(r["gflops_s"] for r in results["flash"]["bwd"])
+    max_cudnn_fwd = max(r["gflops_s"] for r in results["cudnn"]["fwd"])
+    max_cudnn_bwd = max(r["gflops_s"] for r in results["cudnn"]["bwd"])
     peak_fp32 = gpu["peak_compute_tflops"] * 1000
     peak_tc = gpu["peak_compute_tflops_tc"] * 1000
 
     print(f"\nPeak verification:")
     print(f"  GPU FP32 Peak:     {peak_fp32:.0f} GFLOP/s ({gpu['peak_compute_tflops']:.1f} TFLOP/s)")
     print(f"  GPU FP16 TC Peak:  {peak_tc:.0f} GFLOP/s ({gpu['peak_compute_tflops_tc']:.1f} TFLOP/s)")
-    print(f"  Max Achieved (Pallas): {max_flash_gflops:.0f} GFLOP/s ({max_flash_gflops/peak_fp32*100:.1f}% of CUDA peak)")
-    print(f"  Max Achieved (cuDNN):  {max_cudnn_gflops:.0f} GFLOP/s ({max_cudnn_gflops/peak_tc*100:.1f}% of TC peak)")
-    print(f"\n  Note: Pallas/Triton should use TCs but achieves CUDA-level perf (optimization opportunity)")
-    print(f"\n  FLOP counts (per B*H, forward + backward):")
-    print(f"    Naive:  ~12*T^2*D (stores attention matrix, no recompute)")
-    print(f"    Pallas: ~18*T^2*D (recomputes attention twice in backward)")
-    print(f"    cuDNN:  ~14*T^2*D (recomputes attention once in backward)")
+    print(f"  Pallas fwd: {max_flash_fwd:.0f} GFLOP/s ({max_flash_fwd/peak_fp32*100:.1f}% of CUDA peak)")
+    print(f"  Pallas bwd: {max_flash_bwd:.0f} GFLOP/s ({max_flash_bwd/peak_fp32*100:.1f}% of CUDA peak)")
+    print(f"  cuDNN fwd:  {max_cudnn_fwd:.0f} GFLOP/s ({max_cudnn_fwd/peak_tc*100:.1f}% of TC peak)")
+    print(f"  cuDNN bwd:  {max_cudnn_bwd:.0f} GFLOP/s ({max_cudnn_bwd/peak_tc*100:.1f}% of TC peak)")
 
     # Save results to JSON
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -597,10 +610,13 @@ def main():
         json.dump(results, f, indent=2)
     print(f"\nResults saved to: {json_path}")
 
-    # Generate plot
+    # Generate separate forward and backward roofline plots
     if not args.no_plot:
-        plot_path = generate_roofline_plot(results, gpu_key=args.gpu)
-        print(f"\nDone! View plot at: {plot_path}")
+        fwd_plot = generate_roofline_plot(results, pass_type="fwd", gpu_key=args.gpu)
+        bwd_plot = generate_roofline_plot(results, pass_type="bwd", gpu_key=args.gpu)
+        print(f"\nDone! View plots at:")
+        print(f"  Forward:  {fwd_plot}")
+        print(f"  Backward: {bwd_plot}")
 
     print("\n" + "=" * 70)
 
