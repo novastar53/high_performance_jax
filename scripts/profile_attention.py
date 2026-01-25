@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -40,7 +41,8 @@ def profile_attention(B: int, H: int, T: int, D: int, dtype=jnp.float16):
     v = jax.random.normal(keys[2], (B, H, T, D), dtype=dtype)
     do = jax.random.normal(keys[3], (B, H, T, D), dtype=dtype)
 
-    shape_str = f"B{B}_H{H}_T{T}_D{D}"
+    gpu_model = os.environ.get("GPU_MODEL", "unknown").replace(" ", "_")
+    shape_str = f"B{B}_H{H}_T{T}_D{D}_{gpu_model}"
 
     # Create jitted forward functions
     flash_fwd = jax.jit(flash_attention)
@@ -130,6 +132,7 @@ def main():
 
     print(f"JAX devices: {jax.devices()}")
     print(f"Default backend: {jax.default_backend()}")
+    print(f"GPU Model: {os.environ.get('GPU_MODEL', 'not set')}")
     print(f"Traces will be saved to: {get_trace_dir()}")
 
     profile_attention(args.batch, args.heads, args.seq_len, args.head_dim)

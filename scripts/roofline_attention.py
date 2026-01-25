@@ -13,6 +13,7 @@ Usage:
 import sys
 import argparse
 import json
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -48,30 +49,71 @@ else:
     )
 
 
-# GPU Specifications for RTX 4000 Ada
-# From NVIDIA datasheet:
+# GPU Specifications dictionary mapping GPU_MODEL values to specs
+GPU_MODEL_TO_SPECS = {
+    # NVIDIA RTX 4000 Ada
+    "NVIDIA RTX 4000 Ada": {
+        "peak_compute_tflops": 26.7,           # FP32 CUDA core peak
+        "peak_compute_tflops_tc": 106.91,      # FP16 Tensor Core theoretical peak
+        "tensor_tflops_datasheet": 327.6,      # Tensor perf from datasheet (INT8/sparse)
+        "peak_bandwidth_gb_s": 360.0,          # GDDR6 (335.3 GiB/s)
+        "ridge_ai": 26.7e3 / 360.0,            # Ridge point for CUDA cores (~74)
+        "ridge_ai_tc": 106.91e3 / 360.0,       # Ridge point for Tensor Cores (~297)
+    },
+}
+
+# GPU Specifications for RTX 4000 Ada (legacy format, now uses GPU_MODEL_TO_SPECS)
+# From xprof / NVIDIA specs:
 # - FP32 CUDA cores: 26.7 TFLOP/s
-# - FP16 CUDA cores: 26.7 TFLOP/s (1:1 with FP32)
-# - Tensor Performance: 327.6 TFLOP/s (INT8/sparse modes)
-# - Memory Bandwidth: 360 GB/s
+# - FP16 Tensor Cores: 106.91 TFLOP/s (theoretical peak from xprof)
+# - Tensor Performance: 327.6 TFLOP/s (INT8/sparse modes from datasheet)
+# - Memory Bandwidth: 360 GB/s (335.3 GiB/s)
 #
 # Observed performance:
-# - Pallas flash attention: ~27 TFLOP/s
+# - Pallas flash attention: ~27 TFLOP/s (~25% of TC peak)
 #   (Should use tensor cores via Triton, but achieves CUDA-core level perf.
 #    Likely due to suboptimal block sizes, memory patterns, or loop overhead.)
-# - cuDNN flash attention: ~55 TFLOP/s
-#   (Highly optimized, achieves full tensor core throughput)
+# - cuDNN flash attention: ~55 TFLOP/s (~50% of TC peak)
+#   (Highly optimized, typical efficiency for real workloads)
 GPU_SPECS = {
     "rtx4000-ada": {
         "name": "NVIDIA RTX 4000 Ada",
-        "peak_compute_tflops": 26.7,           # FP16/FP32 CUDA core peak
-        "peak_compute_tflops_tc": 53.4,        # FP16 Tensor Core (observed via cuDNN)
+        "peak_compute_tflops": 26.7,           # FP32 CUDA core peak
+        "peak_compute_tflops_tc": 106.91,      # FP16 Tensor Core theoretical peak
         "tensor_tflops_datasheet": 327.6,      # Tensor perf from datasheet (INT8/sparse)
-        "peak_bandwidth_gb_s": 360.0,          # GDDR6
-        "ridge_ai": 26.7e3 / 360.0,            # Ridge point for CUDA cores
-        "ridge_ai_tc": 53.4e3 / 360.0,         # Ridge point for Tensor Cores
+        "peak_bandwidth_gb_s": 360.0,          # GDDR6 (335.3 GiB/s)
+        "ridge_ai": 26.7e3 / 360.0,            # Ridge point for CUDA cores (~74)
+        "ridge_ai_tc": 106.91e3 / 360.0,       # Ridge point for Tensor Cores (~297)
     }
 }
+
+
+def get_gpu_specs(gpu_model: str) -> dict:
+    """Get GPU specifications for the given GPU model.
+
+    Args:
+        gpu_model: GPU model name (e.g., "NVIDIA RTX 4000 Ada")
+
+    Returns:
+        Dictionary with GPU specs including name added from GPU_MODEL_TO_SPECS
+    """
+    if gpu_model in GPU_MODEL_TO_SPECS:
+        specs = GPU_MODEL_TO_SPECS[gpu_model].copy()
+        specs["name"] = gpu_model
+        return specs
+    else:
+        print(f"Warning: GPU model '{gpu_model}' not found in GPU_MODEL_TO_SPECS")
+        print("Available GPU models: " + ", ".join(GPU_MODEL_TO_SPECS.keys()))
+        print("Using default RTX 4000 Ada specs - please update GPU_MODEL_TO_SPECS")
+        return {
+            "name": gpu_model,
+            "peak_compute_tflops": 26.7,
+            "peak_compute_tflops_tc": 106.91,
+            "tensor_tflops_datasheet": 327.6,
+            "peak_bandwidth_gb_s": 360.0,
+            "ridge_ai": 26.7e3 / 360.0,
+            "ridge_ai_tc": 106.91e3 / 360.0,
+        }
 
 
 def calculate_flops_fwd(B: int, H: int, T: int, D: int) -> float:
@@ -306,7 +348,7 @@ def benchmark_attention(
 def generate_roofline_plot(
     results: dict,
     pass_type: str = "fwd",
-    gpu_key: str = "rtx4000-ada",
+    gpu_model: str = None,
     output_path: Path | None = None,
 ):
     """Generate roofline plot for forward or backward pass.
@@ -314,10 +356,13 @@ def generate_roofline_plot(
     Args:
         results: Dict with 'sequence_lengths', 'naive', 'flash', 'cudnn' data
         pass_type: "fwd" for forward pass, "bwd" for backward pass
-        gpu_key: Key for GPU specs in GPU_SPECS
+        gpu_model: GPU model name (e.g., "NVIDIA RTX 4000 Ada")
         output_path: Path to save PNG plot
     """
-    gpu = GPU_SPECS[gpu_key]
+    if gpu_model is None:
+        gpu_model = os.environ.get("GPU_MODEL", "NVIDIA RTX 4000 Ada")
+
+    gpu = get_gpu_specs(gpu_model)
     pass_name = "Forward" if pass_type == "fwd" else "Backward"
 
     seq_lengths = np.array(results["sequence_lengths"])
@@ -356,8 +401,8 @@ def generate_roofline_plot(
 
     # Plot roofs
     ax.plot(ai_range, memory_roof, 'k--', linewidth=2, alpha=0.7, label='Memory roof')
-    ax.plot(ai_range, compute_roof_fp32, 'r--', linewidth=2, alpha=0.7, label='FP32 roof (26.7 TFLOP/s)')
-    ax.plot(ai_range, compute_roof_tc, 'g--', linewidth=2, alpha=0.7, label='FP16 TC roof (53.4 TFLOP/s)')
+    ax.plot(ai_range, compute_roof_fp32, 'r--', linewidth=2, alpha=0.7, label=f'FP32 roof ({gpu["peak_compute_tflops"]:.1f} TFLOP/s)')
+    ax.plot(ai_range, compute_roof_tc, 'g--', linewidth=2, alpha=0.7, label=f'FP16 TC roof ({gpu["peak_compute_tflops_tc"]:.1f} TFLOP/s)')
 
     # Plot actual performance
     ax.scatter(naive_ai, naive_perf, marker='o', s=150, c='red',
@@ -434,7 +479,8 @@ def generate_roofline_plot(
     # Save plot
     if output_path is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = _get_default_trace_dir() / f"roofline_{pass_type}_{timestamp}.png"
+        gpu_filename_safe = gpu_model.replace(" ", "_").replace("/", "_")
+        output_path = _get_default_trace_dir() / f"roofline_{pass_type}_{gpu_filename_safe}_{timestamp}.png"
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
@@ -454,7 +500,6 @@ def main():
                        choices=["float16", "float32"], help="Data type")
     parser.add_argument("--warmup", type=int, default=3, help="Warmup iterations")
     parser.add_argument("--iters", type=int, default=5, help="Profile iterations")
-    parser.add_argument("--gpu", type=str, default="rtx4000-ada", help="GPU model")
     parser.add_argument("--trace-dir", type=str, default=None, help="Directory for outputs")
     parser.add_argument("--no-plot", action="store_true", help="Skip plot generation")
 
@@ -464,6 +509,10 @@ def main():
     if args.trace_dir:
         configure(trace_dir=args.trace_dir)
 
+    # Get GPU model from environment variable
+    gpu_model = os.environ.get("GPU_MODEL", "NVIDIA RTX 4000 Ada")
+    print(f"GPU Model: {gpu_model}")
+
     dtype = jnp.float16 if args.dtype == "float16" else jnp.float32
     seq_lengths = [int(x) for x in args.seq_lengths.split(",")]
 
@@ -471,8 +520,8 @@ def main():
     print("ROOFLINE ANALYSIS FOR ATTENTION")
     print("=" * 70)
 
-    # Print GPU info
-    gpu = GPU_SPECS[args.gpu]
+    # Print GPU info using specs from GPU_MODEL_TO_SPECS
+    gpu = get_gpu_specs(gpu_model)
     print(f"\nGPU: {gpu['name']}")
     print(f"  Peak Compute (CUDA cores):   {gpu['peak_compute_tflops']:.1f} TFLOP/s")
     print(f"  Peak Compute (Tensor cores): {gpu['peak_compute_tflops_tc']:.1f} TFLOP/s (observed)")
@@ -504,7 +553,7 @@ def main():
 
     # Benchmark across sequence lengths
     results = {
-        "gpu": args.gpu,
+        "gpu_model": gpu_model,
         "config": {
             "B": args.batch,
             "H": args.heads,
@@ -604,7 +653,8 @@ def main():
 
     # Save results to JSON
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    json_path = _get_default_trace_dir() / f"roofline_data_{timestamp}.json"
+    gpu_filename_safe = gpu_model.replace(" ", "_").replace("/", "_")
+    json_path = _get_default_trace_dir() / f"roofline_data_{gpu_filename_safe}_{timestamp}.json"
     json_path.parent.mkdir(parents=True, exist_ok=True)
     with open(json_path, "w") as f:
         json.dump(results, f, indent=2)
@@ -612,8 +662,8 @@ def main():
 
     # Generate separate forward and backward roofline plots
     if not args.no_plot:
-        fwd_plot = generate_roofline_plot(results, pass_type="fwd", gpu_key=args.gpu)
-        bwd_plot = generate_roofline_plot(results, pass_type="bwd", gpu_key=args.gpu)
+        fwd_plot = generate_roofline_plot(results, pass_type="fwd", gpu_model=gpu_model)
+        bwd_plot = generate_roofline_plot(results, pass_type="bwd", gpu_model=gpu_model)
         print(f"\nDone! View plots at:")
         print(f"  Forward:  {fwd_plot}")
         print(f"  Backward: {bwd_plot}")
