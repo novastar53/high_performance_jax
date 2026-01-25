@@ -436,18 +436,18 @@ def generate_roofline_plot(
                         ha='left', va='center')
 
     # Ridge point annotation
-    ridge_perf = gpu["peak_compute_tflops"] * 1000  # Convert TFLOP/s to GFLOP/s
+    ridge_perf_fp32 = gpu["peak_compute_tflops"] * 1000  # Convert TFLOP/s to GFLOP/s
     ridge_ai = gpu['ridge_ai']
     ax.axvline(ridge_ai, color='gray', linestyle=':', alpha=0.5)
-    ax.text(ridge_ai, ridge_perf * 0.1, f'  Ridge\n  AI={ridge_ai:.1f}',
+    ax.text(ridge_ai, ridge_perf_fp32 * 0.1, f'  Ridge\n  AI={ridge_ai:.1f}',
             fontsize=10, rotation=90, va='bottom', ha='right')
 
-    # Region annotations - position relative to ridge point
-    ax.text(ridge_ai / 3, ridge_perf * 1.2, 'Memory-Bound\n(AI < Ridge)',
+    # Region annotations - position relative to ridge point (use FP32 peak as reference)
+    ax.text(ridge_ai / 3, ridge_perf_fp32 * 1.2, 'Memory-Bound\n(AI < Ridge)',
             fontsize=11, ha='center', va='top',
             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
 
-    ax.text(ridge_ai * 3, ridge_perf * 1.2, 'Compute-Bound\n(AI > Ridge)',
+    ax.text(ridge_ai * 3, ridge_perf_fp32 * 1.2, 'Compute-Bound\n(AI > Ridge)',
             fontsize=11, ha='center', va='top',
             bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
 
@@ -460,7 +460,7 @@ def generate_roofline_plot(
     # Set axis limits based on data range
     ax.set_xlim(ai_min, ai_max)
     perf_min = all_perf.min() / 2
-    perf_max = max(all_perf.max(), ridge_perf) * 1.5
+    perf_max = max(all_perf.max(), ridge_perf_fp32, compute_roof_tc[0]) * 1.5
     ax.set_ylim(perf_min, perf_max)
 
     ax.set_title(f'Roofline Analysis ({pass_name} Pass): Naive vs Flash (Pallas) vs cuDNN\n{gpu["name"]}',

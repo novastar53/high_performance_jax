@@ -1,4 +1,4 @@
-.PHONY: install clean build dev lint format sync all add add-dev remove regen-lock list lab roofline help
+.PHONY: install clean build dev lint format sync all add add-dev remove regen-lock list lab roofline plot-roofline help
 
 # Default Python version
 PYTHON_VERSION ?= 3.12.8
@@ -184,7 +184,11 @@ lab:
 
 # Generate roofline plot for attention (usage: make roofline [batch=4] [heads=8] [head-dim=64] [seq-lengths=128,256,512,1024,2048,4096])
 roofline:
-	uv run python scripts/roofline_attention.py 
+	uv run python scripts/roofline_attention.py
+
+# Generate roofline plots from JSON file (usage: make plot-roofline json=traces/roofline_data_*.json [output-dir=traces])
+plot-roofline:
+	uv run python scripts/plot_roofline.py $(json) --output-dir=$(output-dir) 
 
 # Help command
 help:
@@ -209,6 +213,7 @@ help:
 	@echo "  make xprof-list   - List available traces"
 	@echo "  make xprof-tunnel - SSH tunnel for xprof [host=runpod1]"
 	@echo "  make roofline - Generate roofline plot for attention batch=4 heads=8 head-dim=64 seq-lengths=128,256,512,1024,2048,4096"
+	@echo "  make plot-roofline - Generate roofline plots from JSON json=traces/roofline_data_*.json [output-dir=traces]"
 	@echo "  make nsight-compute-remote - Run Nsight Compute [host=runpod1]"
 	@echo "  make nsight-systems-remote - Run Nsight Systems [host=runpod1]"
 	@echo "  make download-nsight - Download Nsight profiles [host=runpod1]"

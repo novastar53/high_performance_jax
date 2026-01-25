@@ -33,7 +33,8 @@ notebooks/                     # Interactive tutorials
 └── basic_sharding.ipynb       # Sharding tutorial
 
 scripts/
-└── profile_attention.py       # Example profiling script
+├── profile_attention.py       # Example profiling script
+└── plot_roofline.py          # Generate roofline plots from JSON data
 ```
 
 ## Profiling
@@ -109,6 +110,33 @@ make download-traces h=<host> k=<keyfile>  # Download traces from remote
 make xprof-serve                            # Start xprof server locally
 make xprof-list                             # List available traces
 make xprof-tunnel h=<host> k=<keyfile>      # SSH tunnel for remote viewing
+```
+
+## Roofline Analysis
+
+Generate roofline plots to analyze performance characteristics of attention implementations.
+
+### Generate New Benchmarks
+
+```bash
+make roofline batch=4 heads=8 head-dim=64 seq-lengths=128,256,512,1024,2048,4096
+```
+
+This runs benchmarks and saves:
+- `traces/roofline_data_{GPU_MODEL}_{timestamp}.json` - Benchmark data
+- `traces/roofline_fwd_{GPU_MODEL}_{timestamp}.png` - Forward pass plot
+- `traces/roofline_bwd_{GPU_MODEL}_{timestamp}.png` - Backward pass plot
+
+### Generate Plots from Existing JSON
+
+```bash
+make plot-roofline json=traces/roofline_data_NVIDIA_RTX_4000_Ada_20260125_123456.json output-dir=traces
+```
+
+Or run directly:
+
+```bash
+uv run python scripts/plot_roofline.py traces/roofline_data_*.json --output-dir=traces
 ```
 
 ## Key Patterns
