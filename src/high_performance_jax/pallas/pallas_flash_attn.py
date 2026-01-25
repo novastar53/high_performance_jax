@@ -490,66 +490,48 @@ if __name__ == "__main__":
 
     print(f"Benchmark shape: B={B_bench}, H={H_bench}, T={T_bench}, D={D_bench}")
 
-    def _bench_fwd(fn, q, k, v, iters=20):
+    def _bench(fn, warmup=3, iters=20):
+        """Benchmark a function."""
         # Warmup
-        for _ in range(3):
-            out = fn(q, k, v)
+        for _ in range(warmup):
+            out = fn()
             jax.block_until_ready(out)
         # Bench
         times = []
         for _ in range(iters):
             t0 = time.perf_counter()
-            out = fn(q, k, v)
+            out = fn()
             jax.block_until_ready(out)
             times.append(time.perf_counter() - t0)
         return sum(times) / len(times) * 1000  # ms
 
-    def _bench_bwd(fn, q, k, v, do, iters=20):
-        # Warmup
-        for _ in range(3):
-            grads = jax.grad(lambda q, k, v: jnp.sum(fn(q, k, v) * do), argnums=(0, 1, 2))(q, k, v)
-            jax.block_until_ready(grads)
-        # Bench
-        times = []
-        for _ in range(iters):
-            t0 = time.perf_counter()
-            grads = jax.grad(lambda q, k, v: jnp.sum(fn(q, k, v) * do), argnums=(0, 1, 2))(q, k, v)
-            jax.block_until_ready(grads)
-            times.append(time.perf_counter() - t0)
-        return sum(times) / len(times) * 1000  # ms
+    # Create jitted forward functions
+    jax_fwd = jax.jit(cudnn_attention)
+    flash_fwd = jax.jit(flash_attention)
+    ref_fwd = jax.jit(mha_reference)
 
-    # JAX built-in (note: different input layout - expects (B, T, H, D))
-    @jax.jit
-    def jax_dot_product_attention(q, k, v):
-        # Transpose from (B, H, T, D) to (B, T, H, D) for jax.nn.dot_product_attention
-        q_t = jnp.transpose(q, (0, 2, 1, 3))
-        k_t = jnp.transpose(k, (0, 2, 1, 3))
-        v_t = jnp.transpose(v, (0, 2, 1, 3))
-        out = jax.nn.dot_product_attention(q_t, k_t, v_t, implementation='cudnn')
-        return jnp.transpose(out, (0, 2, 1, 3))  # Back to (B, H, T, D)
-
-    # Our flash attention
-    @jax.jit
-    def our_flash_attention_fn(q, k, v):
-        return flash_attention(q, k, v)
-
-    # Reference (materialized attention matrix)
-    @jax.jit
-    def reference_attention(q, k, v):
-        return mha_reference(q, k, v)
+    # Get vjp functions for backward pass
+    _, jax_vjp = jax.vjp(cudnn_attention, q_bench, k_bench, v_bench)
+    _, flash_vjp = jax.vjp(flash_attention, q_bench, k_bench, v_bench)
+    _, ref_vjp = jax.vjp(mha_reference, q_bench, k_bench, v_bench)
 
     print("\nForward pass:")
-    t_jax = _bench_fwd(jax_dot_product_attention, q_bench, k_bench, v_bench)
+    t_jax = _bench(lambda: jax_fwd(q_bench, k_bench, v_bench))
     print(f"  JAX dot_product_attention: {t_jax:.3f} ms")
-    t_ours = _bench_fwd(our_flash_attention_fn, q_bench, k_bench, v_bench)
+    t_ours = _bench(lambda: flash_fwd(q_bench, k_bench, v_bench))
     print(f"  Our flash_attention:       {t_ours:.3f} ms")
-    t_ref = _bench_fwd(reference_attention, q_bench, k_bench, v_bench)
+    t_ref = _bench(lambda: ref_fwd(q_bench, k_bench, v_bench))
     print(f"  Reference (materialized):  {t_ref:.3f} ms")
 
-    print("\nBackward pass:")
-    t_jax_bwd = _bench_bwd(jax_dot_product_attention, q_bench, k_bench, v_bench, do_bench)
+    print("\nBackward pass only:")
+    t_jax_bwd = _bench(lambda: jax_vjp(do_bench))
     print(f"  JAX dot_product_attention: {t_jax_bwd:.3f} ms")
-    t_ours_bwd = _bench_bwd(our_flash_attention_fn, q_bench, k_bench, v_bench, do_bench)
+    t_ours_bwd = _bench(lambda: flash_vjp(do_bench))
     print(f"  Our flash_attention:       {t_ours_bwd:.3f} ms")
-    t_ref_bwd = _bench_bwd(reference_attention, q_bench, k_bench, v_bench, do_bench)
+    t_ref_bwd = _bench(lambda: ref_vjp(do_bench))
     print(f"  Reference (materialized):  {t_ref_bwd:.3f} ms")
+
+    print("\nTotal (Forward + Backward):")
+    print(f"  JAX dot_product_attention: {t_jax + t_jax_bwd:.3f} ms")
+    print(f"  Our flash_attention:       {t_ours + t_ours_bwd:.3f} ms")
+    print(f"  Reference (materialized):  {t_ref + t_ref_bwd:.3f} ms")
