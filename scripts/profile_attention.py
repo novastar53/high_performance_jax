@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Profile flash attention implementations (forward + backward).
+"""Profile flash attention implementations (forward and backward separately).
 
 Usage:
     # On remote GPU machine:
@@ -30,7 +30,7 @@ from high_performance_jax.pallas.pallas_flash_attn import flash_attention, mha_r
 
 
 def profile_attention(B: int, H: int, T: int, D: int, dtype=jnp.float16):
-    """Profile forward+backward pass for flash attention and reference."""
+    """Profile forward and backward passes separately for each attention implementation."""
     print(f"\nProfiling attention: B={B}, H={H}, T={T}, D={D}, dtype={dtype}")
 
     key = jax.random.key(42)
@@ -40,46 +40,67 @@ def profile_attention(B: int, H: int, T: int, D: int, dtype=jnp.float16):
     v = jax.random.normal(keys[2], (B, H, T, D), dtype=dtype)
     do = jax.random.normal(keys[3], (B, H, T, D), dtype=dtype)
 
-    # Flash attention forward+backward
-    def flash_loss(q, k, v):
-        return jnp.sum(flash_attention(q, k, v) * do)
+    shape_str = f"B{B}_H{H}_T{T}_D{D}"
 
-    flash_fwd_bwd = jax.jit(jax.value_and_grad(flash_loss, argnums=(0, 1, 2)))
+    # Create jitted forward functions
+    flash_fwd = jax.jit(flash_attention)
+    ref_fwd = jax.jit(mha_reference)
+    cudnn_fwd = jax.jit(cudnn_attention)
 
+    # Get vjp functions for backward passes
+    _, flash_vjp = jax.vjp(flash_attention, q, k, v)
+    _, ref_vjp = jax.vjp(mha_reference, q, k, v)
+    _, cudnn_vjp = jax.vjp(cudnn_attention, q, k, v)
+
+    # Profile Flash Attention
     print("\n" + "="*60)
-    print("Profiling: Flash Attention (forward + backward)")
+    print("Profiling: Flash Attention (forward)")
     print("="*60)
     profile_function(
-        f"flash_attention_B{B}_H{H}_T{T}_D{D}",
-        lambda: jax.block_until_ready(flash_fwd_bwd(q, k, v))
+        f"flash_fwd_{shape_str}",
+        lambda: jax.block_until_ready(flash_fwd(q, k, v))
     )
 
-    # Reference attention forward+backward
-    def ref_loss(q, k, v):
-        return jnp.sum(mha_reference(q, k, v) * do)
-
-    ref_fwd_bwd = jax.jit(jax.value_and_grad(ref_loss, argnums=(0, 1, 2)))
-
     print("\n" + "="*60)
-    print("Profiling: Reference Attention (forward + backward)")
+    print("Profiling: Flash Attention (backward)")
     print("="*60)
     profile_function(
-        f"reference_attention_B{B}_H{H}_T{T}_D{D}",
-        lambda: jax.block_until_ready(ref_fwd_bwd(q, k, v))
+        f"flash_bwd_{shape_str}",
+        lambda: jax.block_until_ready(flash_vjp(do))
     )
 
-    # cuDNN attention forward+backward
-    def cudnn_loss(q, k, v):
-        return jnp.sum(cudnn_attention(q, k, v) * do)
-
-    cudnn_fwd_bwd = jax.jit(jax.value_and_grad(cudnn_loss, argnums=(0, 1, 2)))
-
+    # Profile Reference Attention
     print("\n" + "="*60)
-    print("Profiling: cuDNN Attention (forward + backward)")
+    print("Profiling: Reference Attention (forward)")
     print("="*60)
     profile_function(
-        f"cudnn_attention_B{B}_H{H}_T{T}_D{D}",
-        lambda: jax.block_until_ready(cudnn_fwd_bwd(q, k, v))
+        f"reference_fwd_{shape_str}",
+        lambda: jax.block_until_ready(ref_fwd(q, k, v))
+    )
+
+    print("\n" + "="*60)
+    print("Profiling: Reference Attention (backward)")
+    print("="*60)
+    profile_function(
+        f"reference_bwd_{shape_str}",
+        lambda: jax.block_until_ready(ref_vjp(do))
+    )
+
+    # Profile cuDNN Attention
+    print("\n" + "="*60)
+    print("Profiling: cuDNN Attention (forward)")
+    print("="*60)
+    profile_function(
+        f"cudnn_fwd_{shape_str}",
+        lambda: jax.block_until_ready(cudnn_fwd(q, k, v))
+    )
+
+    print("\n" + "="*60)
+    print("Profiling: cuDNN Attention (backward)")
+    print("="*60)
+    profile_function(
+        f"cudnn_bwd_{shape_str}",
+        lambda: jax.block_until_ready(cudnn_vjp(do))
     )
 
 
