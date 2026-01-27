@@ -95,7 +95,7 @@ When writing content for blogposts or notebooks, follow these style guidelines:
 
 1. **Use short paragraphs** - Keep paragraphs concise for better readability.
 
-2. **Avoid bullets, lists, and tables** - Write paragraphs instead of using bullet points or tables.
+2. **Avoid bullets and lists** - Write paragraphs instead of using bullet points or lists. Exception: Explicitly sequential steps like algorithms or processes.
 
 3. **Avoid contrastive phrasing** - Don't use constructions like "it's not this - it's that." State what something is directly.
 
@@ -104,3 +104,36 @@ When writing content for blogposts or notebooks, follow these style guidelines:
 5. **Use LaTeX for math** - Write mathematical expressions using LaTeX syntax ($$...$$ or $...$).
 
 6. **Don't use backticks for variable names** - Write variable names inline without code formatting (e.g., use flash_attention_fwd instead of `flash_attention_fwd`).
+
+7. **Use LaTeX for matrix dimensions** - write $(B, T, C)$ rather than `(B, T, C)` and write $B$ rather than `B` or B'.
+
+8. **Use LaTeX for matrix math** - instead of A@B^T or `A@B^T`, prefer using latex notation $AB^T$ instead.
+
+## Plotting Guidelines
+
+When creating matplotlib plots for notebooks or blog posts, follow these style guidelines:
+
+1. **Use default matplotlib fontsizes** - Do not specify explicit `fontsize=` parameters in `set_xlabel()`, `set_ylabel()`, `set_title()`, `legend()`, `annotate()`, or `text()` calls. Let matplotlib use its default sizes.
+
+2. **Avoid bold fonts** - Do not use `fontweight='bold'` on labels or titles. Keep text at normal weight.
+
+3. **Use consistent figure sizes**:
+   - For single plots: `figsize=(10, 4)` or use matplotlib default
+   - For subplots with 1 row, 2 columns: `figsize=(10, 4)`
+   - Do not use `suptitle()` for overall titles - titles should be per-plot
+
+4. **Keep styling minimal** - Let matplotlib's defaults and the seaborn-v0_8-darkgrid style do the work. Avoid overly-customized styling that makes plots look cluttered.
+
+5. **Reference style** - Look at `how-residual-connections-work.ipynb` in the blog repo for examples of the clean, minimalist plotting style to emulate.
+
+Example correct plotting pattern:
+```python
+fig, ax = plt.subplots(figsize=(10, 4)
+ax.plot(x, y, 'o-', label='Series A')
+ax.set_xlabel('X-axis label')
+ax.set_ylabel('Y-axis label')
+ax.set_title('Plot Title')
+ax.legend(loc='upper left')
+plt.tight_layout()
+plt.show()
+```
