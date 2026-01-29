@@ -16,7 +16,7 @@ dependencies = [
     "ipykernel>=6.29.5",
     "tqdm>=4.67.1",
     "lax>=1.0.0",
-    "deepkit>=1.0.9",
+    "deepkit",
     "flax>=0.12.2",
     "xprof>=0.0.8",
     "matplotlib>=3.10.8",
@@ -41,5 +41,6 @@ dev = [
 packages = ["src/high_performance_jax"]
 
 [tool.uv.sources]
+deepkit = { path = "../deepkit" }
 libtpu = { url = "https://storage.googleapis.com/libtpu-nightly-releases/wheels/libtpu/libtpu-0.0.16.dev20250522+nightly-py3-none-manylinux_2_31_x86_64.whl" }
 high-performance-jax = { workspace = true }
