@@ -2,6 +2,9 @@ git config --global user.email "pvikram035@gmail.com"
 git config --global user.name "Vikram Pawar"
 export TERM=xterm-256color
 
+# Download deepkit 
+git clone https://github.com/novastar53/deepkit ../deepkit
+
 # Detect and export GPU model if available
 if command -v nvidia-smi &> /dev/null; then
     export GPU_MODEL=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n1 | xargs)
