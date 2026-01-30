@@ -21,6 +21,7 @@ dependencies = [
     "xprof>=0.0.8",
     "matplotlib>=3.10.8",
     "python-dotenv>=1.0.0",
+    "scikit-learn>=1.8.0",
 ]
 
 [project.optional-dependencies]
