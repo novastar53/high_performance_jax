@@ -46,6 +46,7 @@ NUM_WARPS = 4
 NUM_STAGES = 3
 DTYPE = jnp.bfloat16
 JAX_SDPA_IMPL = "cudnn"
+CAUSAL = True
 
 if INTERPRET_MODE:
     JAX_SDPA_IMPL = "xla"
@@ -55,19 +56,18 @@ if INTERPRET_MODE:
 # Reference implementations
 
 @jax.jit
-def mha_reference(q, k, v, causal=False):
+def mha_reference(q, k, v):
     """Reference multi-head attention (materializes N×N matrix).
 
     Computes: softmax(Q @ K^T / sqrt(d)) @ V
     Input shape: (B, H, T, D) - batch, heads, sequence, head_dim
     """
     d = q.shape[-1]
-    scale = 1.0 / jnp.sqrt(d)
-    logits = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
-    if causal:
+    logits = jnp.einsum('bhqd,bhkd->bhqk', q, k) / math.sqrt(d)
+    if CAUSAL:
         T = q.shape[2]
-        mask = jnp.triu(jnp.ones((T, T)), k=1) * -jnp.inf
-        logits = logits + mask[None, None, :, :]
+        mask = jnp.triu(jnp.ones((T, T), dtype=jnp.bool_), k=1)
+        logits = jnp.where(mask, -jnp.inf, logits)
     probs = jax.nn.softmax(logits, axis=-1)
     return jnp.einsum('bhqk,bhkd->bhqd', probs, v)
 
@@ -75,15 +75,18 @@ def mha_reference(q, k, v, causal=False):
 def _compute_logsumexp(q, k):
     """Compute logsumexp of attention logits (for testing flash attention)."""
     d = q.shape[-1]
-    scale = 1.0 / jnp.sqrt(d)
-    logits = jnp.einsum('bhqd,bhkd->bhqk', q, k) * scale
+    logits = jnp.einsum('bhqd,bhkd->bhqk', q, k) / math.sqrt(d)
+    if CAUSAL:
+        T = q.shape[2]
+        mask = jnp.triu(jnp.ones((T, T), dtype=jnp.bool_), k=1)
+        logits = jnp.where(mask, -jnp.inf, logits)
     logits_max = jnp.max(logits, axis=-1)
     logits_shift = logits - logits_max[..., None]
     return logits_max + jnp.log(jnp.sum(jnp.exp(logits_shift), axis=-1))
 
 
 @jax.jit
-def cudnn_attention(q, k, v, causal=False):
+def cudnn_attention(q, k, v):
     """JAX cuDNN flash attention wrapper.
 
     Wraps jax.nn.dot_product_attention with layout transposition.
@@ -93,13 +96,13 @@ def cudnn_attention(q, k, v, causal=False):
     q_t = jnp.transpose(q, (0, 2, 1, 3))
     k_t = jnp.transpose(k, (0, 2, 1, 3))
     v_t = jnp.transpose(v, (0, 2, 1, 3))
-    out = jax.nn.dot_product_attention(q_t, k_t, v_t, implementation=JAX_SDPA_IMPL)
+    out = jax.nn.dot_product_attention(q_t, k_t, v_t, implementation=JAX_SDPA_IMPL, is_causal=CAUSAL)
     return jnp.transpose(out, (0, 2, 1, 3))  # Back to (B, H, T, D)
 
 
 # Flash Attention Forward
 
-def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, scale, num_k_blocks, causal):
+def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, scale, num_k_blocks):
     """Flash attention forward kernel."""
     q_reg = plgpu.load(q_ref.at[0, :, :])
     o_reg = jnp.zeros(q_reg.shape, jnp.float32)
@@ -107,12 +110,20 @@ def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, sca
     l_reg = jnp.zeros((BLOCK_R,), dtype=jnp.float32)
     logsumexp_reg = jnp.zeros((BLOCK_R,), dtype=jnp.float32)
 
+    blk_idx = pl.program_id(1)
+    q_idx = BLOCK_R * blk_idx + jnp.arange(BLOCK_R)
+
     def num_body(t, args):
         max_reg, l_reg, o_reg = args
         idx = pl.dslice(t * BLOCK_C, BLOCK_C)
+        kv_idx = BLOCK_C * t + jnp.arange(BLOCK_C)
         k_blk = plgpu.load(k_ref.at[0, idx, :])
         v_blk = plgpu.load(v_ref.at[0, idx, :])
         s_blk = pl.dot(q_reg, k_blk, trans_b=True, precision='float32') / scale
+        if CAUSAL:
+            mask = kv_idx[None, :] > q_idx[:, None]
+            s_blk = jnp.where(mask, -jnp.inf, s_blk)
+
         max_blk = jnp.maximum(max_reg, jnp.max(s_blk, axis=-1))
         s_blk = jnp.exp(s_blk - max_blk[:, None])
         l_blk = jnp.sum(s_blk, axis=-1)
@@ -130,7 +141,7 @@ def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, sca
 
 
 @jax.jit
-def flash_attention_fwd(q, k, v, causal=False):
+def flash_attention_fwd(q, k, v):
     """Flash attention forward pass."""
     B, H, T, C = q.shape
     B_flat = B*H
@@ -142,7 +153,7 @@ def flash_attention_fwd(q, k, v, causal=False):
     grid = (B_flat, pl.cdiv(T, BLOCK_R))
 
     out_flat, logsumexp = pl.pallas_call(
-        partial(flash_attention_fwd_kernel, scale=scale, num_k_blocks=num_k_blocks, causal=causal),
+        partial(flash_attention_fwd_kernel, scale=scale, num_k_blocks=num_k_blocks),
         out_shape=[
             jax.ShapeDtypeStruct(q_flat.shape, q_flat.dtype),
             jax.ShapeDtypeStruct((B*H, T), q_flat.dtype)
@@ -177,7 +188,7 @@ def flash_attention_fwd(q, k, v, causal=False):
 # 3. dQ: outer loop over Q blocks, inner loop over KV blocks
 
 
-def flash_attention_bwd_preprocess_kernel(o_ref, do_ref, d_ref, *, causal):
+def flash_attention_bwd_preprocess_kernel(o_ref, do_ref, d_ref):
     """Compute D = rowsum(O ⊙ dO) for backward pass.
 
     D is used in the softmax backward: dS = P ⊙ (dP - D)
@@ -189,13 +200,13 @@ def flash_attention_bwd_preprocess_kernel(o_ref, do_ref, d_ref, *, causal):
     plgpu.store(d_ref, d_reg.astype(d_ref.dtype))
 
 
-def flash_attention_bwd_preprocess(o_flat, do_flat, causal):
+def flash_attention_bwd_preprocess(o_flat, do_flat):
     """Preprocess for backward: compute D = rowsum(O ⊙ dO)."""
     B_flat, T, C = o_flat.shape
     grid = (B_flat, pl.cdiv(T, BLOCK_R))
 
     d_flat = pl.pallas_call(
-        partial(flash_attention_bwd_preprocess_kernel, causal=causal),
+        partial(flash_attention_bwd_preprocess_kernel),
         out_shape=jax.ShapeDtypeStruct((B_flat, T), o_flat.dtype),
         grid=grid,
         in_specs=[
@@ -215,7 +226,7 @@ def flash_attention_bwd_preprocess(o_flat, do_flat, causal):
 def flash_attention_bwd_dkv_kernel(
     q_ref, k_ref, v_ref, do_ref, logsumexp_ref, d_ref,
     dk_ref, dv_ref,
-    *, scale, num_q_blocks, causal
+    *, scale, num_q_blocks,
 ):
     """Compute dK and dV gradients.
 
@@ -252,14 +263,14 @@ def flash_attention_bwd_dkv_kernel(
     plgpu.store(dv_ref, dv_acc.astype(dv_ref.dtype))
 
 
-def flash_attention_bwd_dkv(q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_flat, scale, causal):
+def flash_attention_bwd_dkv(q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_flat, scale):
     """Compute dK and dV using pallas_call."""
     B_flat, T, C = q_flat.shape
     num_q_blocks = pl.cdiv(T, BLOCK_R)
     grid = (B_flat, pl.cdiv(T, BLOCK_C))  # Outer loop over KV blocks
 
     dk_flat, dv_flat = pl.pallas_call(
-        partial(flash_attention_bwd_dkv_kernel, scale=scale, num_q_blocks=num_q_blocks, causal=causal),
+        partial(flash_attention_bwd_dkv_kernel, scale=scale, num_q_blocks=num_q_blocks),
         out_shape=[
             jax.ShapeDtypeStruct(k_flat.shape, k_flat.dtype),  # dK
             jax.ShapeDtypeStruct(v_flat.shape, v_flat.dtype),  # dV
@@ -289,7 +300,7 @@ def flash_attention_bwd_dkv(q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_f
 def flash_attention_bwd_dq_kernel(
     q_ref, k_ref, v_ref, do_ref, logsumexp_ref, d_ref,
     dq_ref,
-    *, scale, num_kv_blocks, causal
+    *, scale, num_kv_blocks 
 ):
     """Compute dQ gradient.
 
@@ -320,14 +331,14 @@ def flash_attention_bwd_dq_kernel(
     plgpu.store(dq_ref, dq_acc.astype(dq_ref.dtype))
 
 
-def flash_attention_bwd_dq(q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_flat, scale, causal):
+def flash_attention_bwd_dq(q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_flat, scale):
     """Compute dQ using pallas_call."""
     B_flat, T, C = q_flat.shape
     num_kv_blocks = pl.cdiv(T, BLOCK_C)
     grid = (B_flat, pl.cdiv(T, BLOCK_R))  # Outer loop over Q blocks
 
     dq_flat = pl.pallas_call(
-        partial(flash_attention_bwd_dq_kernel, scale=scale, num_kv_blocks=num_kv_blocks, causal=causal),
+        partial(flash_attention_bwd_dq_kernel, scale=scale, num_kv_blocks=num_kv_blocks),
         out_shape=jax.ShapeDtypeStruct(q_flat.shape, q_flat.dtype),
         grid=grid,
         in_specs=[
@@ -349,7 +360,7 @@ def flash_attention_bwd_dq(q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_fl
 
 
 @jax.jit
-def flash_attention_bwd(q, k, v, o, logsumexp, do, causal):
+def flash_attention_bwd(q, k, v, o, logsumexp, do):
     """Flash attention backward pass using 3 separate kernels."""
     B, H, T, C = q.shape
     scale = math.sqrt(C)
@@ -363,16 +374,16 @@ def flash_attention_bwd(q, k, v, o, logsumexp, do, causal):
     logsumexp_flat = logsumexp.reshape(-1, T)
 
     # Kernel 1: Preprocess - compute D = rowsum(O ⊙ dO)
-    d_flat = flash_attention_bwd_preprocess(o_flat, do_flat, causal)
+    d_flat = flash_attention_bwd_preprocess(o_flat, do_flat)
 
     # Kernel 2: Compute dK, dV (outer loop over KV blocks)
     dk_flat, dv_flat = flash_attention_bwd_dkv(
-        q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_flat, scale, causal
+        q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_flat, scale
     )
 
     # Kernel 3: Compute dQ (outer loop over Q blocks)
     dq_flat = flash_attention_bwd_dq(
-        q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_flat, scale, causal
+        q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_flat, scale
     )
 
     return (
@@ -385,19 +396,19 @@ def flash_attention_bwd(q, k, v, o, logsumexp, do, causal):
 # Custom VJP wrapper
 
 @jax.custom_vjp
-def flash_attention(q, k, v, causal=False):
+def flash_attention(q, k, v):
     """Flash attention with custom backward pass."""
-    o, _ = flash_attention_fwd(q, k, v, causal)
+    o, _ = flash_attention_fwd(q, k, v)
     return o
 
 
-def flash_attention_fwd_rule(q, k, v, causal):
+def flash_attention_fwd_rule(q, k, v):
     """Forward rule for custom_vjp.
 
     Returns the output and residuals needed for backward pass.
     """
-    o, logsumexp = flash_attention_fwd(q, k, v, causal)
-    return o, (q, k, v, o, logsumexp, causal)
+    o, logsumexp = flash_attention_fwd(q, k, v)
+    return o, (q, k, v, o, logsumexp)
 
 
 def flash_attention_bwd_rule(res, do):
@@ -406,8 +417,8 @@ def flash_attention_bwd_rule(res, do):
     Takes residuals from forward and upstream gradient dO,
     returns gradients (dQ, dK, dV).
     """
-    q, k, v, o, logsumexp, causal = res
-    dq, dk, dv = flash_attention_bwd(q, k, v, o, logsumexp, do, causal)
+    q, k, v, o, logsumexp = res
+    dq, dk, dv = flash_attention_bwd(q, k, v, o, logsumexp, do)
     return dq, dk, dv
 
 
@@ -429,21 +440,19 @@ if __name__ == "__main__":
     # Forward check
     o_ref = mha_reference(q, k, v)
     logsumexp_ref = _compute_logsumexp(q, k)
-    print(f"Reference output shape: {o_ref.dtype, o_ref.shape}")
+    o_cudnn_ref = cudnn_attention(q, k, v)
+    o_flash, logsumexp_flash = flash_attention_fwd(q, k, v)
+
+    assert jnp.allclose(o_cudnn_ref, o_ref, atol=1e-1, rtol=1e-2),f"o max diff: {jnp.max(jnp.abs(o_cudnn_ref - o_ref))}"
+    assert jnp.allclose(o_flash, o_ref, atol=1e-1, rtol=1e-2), f"o max diff: {jnp.max(jnp.abs(o_flash - o_ref))}"
+    assert jnp.allclose(logsumexp_flash, logsumexp_ref, atol=1e-2, rtol=1e-2), f"logsumexp max diff: {jnp.max(jnp.abs(logsumexp_flash - logsumexp_ref))}"
+    print("Forward pass check passed!")
 
     # Backward check (reference)
     def loss_ref(q, k, v):
         return jnp.sum(mha_reference(q, k, v) * do)
 
     dq_ref, dk_ref, dv_ref = jax.grad(loss_ref, argnums=(0, 1, 2))(q, k, v)
-    print(f"Reference gradient shapes: dq={dq_ref.shape}, dk={dk_ref.shape}, dv={dv_ref.shape}")
-
-    # Test forward pass (using flash_attention_fwd directly to get logsumexp)
-    o_flash, logsumexp_flash = flash_attention_fwd(q, k, v)
-    assert jnp.allclose(o_flash, o_ref, atol=1e-2, rtol=1e-2)
-    assert jnp.allclose(logsumexp_flash, logsumexp_ref, atol=1e-2, rtol=1e-2)
-    print("Forward pass check passed!")
-
     # Test preprocess kernel: D = rowsum(O * dO)
     d_ref = jnp.sum((o_flash * do).astype(jnp.float32), axis=-1).astype(DTYPE)  # (B, H, T)
     o_flat = o_flash.reshape(-1, T, D)
