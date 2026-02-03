@@ -113,25 +113,45 @@ def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, sca
     blk_idx = pl.program_id(1)
     q_idx = BLOCK_R * blk_idx + jnp.arange(BLOCK_R)
 
-    def num_body(t, args):
+    def num_body_noncausal(t, args):
+        max_reg, l_reg, o_reg = args
+        idx = pl.dslice(t * BLOCK_C, BLOCK_C)
+        k_blk = plgpu.load(k_ref.at[0, idx, :])
+        v_blk = plgpu.load(v_ref.at[0, idx, :])
+        s_blk = pl.dot(q_reg, k_blk, trans_b=True, precision='float32') / scale
+        max_blk = jnp.maximum(max_reg, jnp.max(s_blk, axis=-1))
+        s_blk = jnp.exp(s_blk - max_blk[:, None])
+        l_blk = jnp.sum(s_blk, axis=-1)
+        o_blk = pl.dot(s_blk.astype(v_blk.dtype), v_blk)
+        return (max_blk,
+                l_reg * jnp.exp(max_reg - max_blk) + l_blk,
+                o_reg * jnp.exp(max_reg - max_blk)[:, None] + o_blk)
+
+    def num_body_causal(t, args):
         max_reg, l_reg, o_reg = args
         idx = pl.dslice(t * BLOCK_C, BLOCK_C)
         kv_idx = BLOCK_C * t + jnp.arange(BLOCK_C)
         k_blk = plgpu.load(k_ref.at[0, idx, :])
         v_blk = plgpu.load(v_ref.at[0, idx, :])
-        s_blk = pl.dot(q_reg, k_blk, trans_b=True, precision='float32') / scale
-        if CAUSAL:
+
+        def compute_block(_):
+            s_blk = pl.dot(q_reg, k_blk, trans_b=True, precision='float32') / scale
             mask = kv_idx[None, :] > q_idx[:, None]
             s_blk = jnp.where(mask, -jnp.inf, s_blk)
+            max_blk = jnp.maximum(max_reg, jnp.max(s_blk, axis=-1))
+            s_blk = jnp.exp(s_blk - max_blk[:, None])
+            l_blk = jnp.sum(s_blk, axis=-1)
+            o_blk = pl.dot(s_blk.astype(v_blk.dtype), v_blk)
+            return (max_blk,
+                    l_reg * jnp.exp(max_reg - max_blk) + l_blk,
+                    o_reg * jnp.exp(max_reg - max_blk)[:, None] + o_blk)
 
-        max_blk = jnp.maximum(max_reg, jnp.max(s_blk, axis=-1))
-        s_blk = jnp.exp(s_blk - max_blk[:, None])
-        l_blk = jnp.sum(s_blk, axis=-1)
-        o_blk = pl.dot(s_blk.astype(v_blk.dtype), v_blk)
-        return (max_blk, 
-                l_reg * jnp.exp(max_reg - max_blk) + l_blk, 
-                o_reg * jnp.exp(max_reg - max_blk)[:, None] + o_blk)
+        def skip_block(_):
+            return (max_reg, l_reg, o_reg)
 
+        return jax.lax.cond(kv_idx[0] > q_idx[-1], skip_block, compute_block, None)
+
+    num_body = num_body_causal if CAUSAL else num_body_noncausal
     max_reg, l_reg, o_reg = jax.lax.fori_loop(0, num_k_blocks, num_body, (max_reg, l_reg, o_reg))
     logsumexp_reg = max_reg + jnp.log(l_reg)
     o_reg = o_reg / l_reg[:, None]
