@@ -616,7 +616,7 @@ if __name__ == "__main__":
         # Get vjp functions for backward pass
         _, jax_vjp = jax.vjp(cudnn_attention, q_bench, k_bench, v_bench)
         _, flash_vjp = jax.vjp(flash_attention, q_bench, k_bench, v_bench)
-        _, ref_vjp = jax.vjp(mha_reference, q_bench, k_bench, v_bench)
+        #_, ref_vjp = jax.vjp(mha_reference, q_bench, k_bench, v_bench)
         if not INTERPRET_MODE:
             _, flash_attn_jax_vjp = jax.vjp(flash_attn_jax_wrapper, q_bench, k_bench, v_bench)
 
@@ -625,8 +625,8 @@ if __name__ == "__main__":
         print(f"  JAX dot_product_attention: {t_jax:.3f} ms")
         t_ours = _bench(lambda: flash_fwd(q_bench, k_bench, v_bench))
         print(f"  Our flash_attention:       {t_ours:.3f} ms")
-        t_ref = _bench(lambda: ref_fwd(q_bench, k_bench, v_bench))
-        print(f"  Reference (materialized):  {t_ref:.3f} ms")
+        #t_ref = _bench(lambda: ref_fwd(q_bench, k_bench, v_bench))
+        #print(f"  Reference (materialized):  {t_ref:.3f} ms")
         if not INTERPRET_MODE:
             t_flash_attn_jax = _bench(lambda: flash_attn_jax_fwd(q_bench, k_bench, v_bench))
             print(f"  flash_attn_jax (C++ CUDA):  {t_flash_attn_jax:.3f} ms")
@@ -636,8 +636,8 @@ if __name__ == "__main__":
         print(f"  JAX dot_product_attention: {t_jax_bwd:.3f} ms")
         t_ours_bwd = _bench(lambda: flash_vjp(do_bench))
         print(f"  Our flash_attention:       {t_ours_bwd:.3f} ms")
-        t_ref_bwd = _bench(lambda: ref_vjp(do_bench))
-        print(f"  Reference (materialized):  {t_ref_bwd:.3f} ms")
+        #t_ref_bwd = _bench(lambda: ref_vjp(do_bench))
+        #print(f"  Reference (materialized):  {t_ref_bwd:.3f} ms")
         if not INTERPRET_MODE:
             t_flash_attn_jax_bwd = _bench(lambda: flash_attn_jax_vjp(do_bench))
             print(f"  flash_attn_jax (C++ CUDA):  {t_flash_attn_jax_bwd:.3f} ms")
@@ -645,6 +645,6 @@ if __name__ == "__main__":
         print("\nTotal (Forward + Backward):")
         print(f"  JAX dot_product_attention: {t_jax + t_jax_bwd:.3f} ms")
         print(f"  Our flash_attention:       {t_ours + t_ours_bwd:.3f} ms")
-        print(f"  Reference (materialized):  {t_ref + t_ref_bwd:.3f} ms")
+        #print(f"  Reference (materialized):  {t_ref + t_ref_bwd:.3f} ms")
         if not INTERPRET_MODE:
             print(f"  flash_attn_jax (C++ CUDA):  {t_flash_attn_jax + t_flash_attn_jax_bwd:.3f} ms")
