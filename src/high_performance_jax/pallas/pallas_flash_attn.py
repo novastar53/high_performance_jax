@@ -584,7 +584,7 @@ if __name__ == "__main__":
 
         # Use larger sizes for meaningful timing
         # Use bfloat16 for cuDNN compatibility
-        B_bench, H_bench, T_bench, D_bench = 4, 8, 4096, 64
+        B_bench, H_bench, T_bench, D_bench = 4, 8, 8192, 64
         q_bench = jax.random.normal(keys[0], (B_bench, H_bench, T_bench, D_bench), dtype=DTYPE)
         k_bench = jax.random.normal(keys[1], (B_bench, H_bench, T_bench, D_bench), dtype=DTYPE)
         v_bench = jax.random.normal(keys[2], (B_bench, H_bench, T_bench, D_bench), dtype=DTYPE)
