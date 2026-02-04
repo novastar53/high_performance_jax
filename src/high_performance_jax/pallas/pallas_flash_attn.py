@@ -100,6 +100,27 @@ def cudnn_attention(q, k, v):
     return jnp.transpose(out, (0, 2, 1, 3))  # Back to (B, H, T, D)
 
 
+def flash_attn_jax_wrapper(q, k, v):
+    """Reference nshepperd/flash_attn_jax implementation (C++ CUDA kernels).
+
+    Wraps flash_attn_jax.flash_mha with layout conversion.
+    Requires: pip install flash-attn-jax (already in pyproject.toml [gpu])
+
+    Input shape: (B, H, T, D) - batch, heads, sequence, head_dim
+    Output shape: (B, H, T, D)
+    """
+    from flash_attn_jax import flash_mha
+
+    # nshepperd/flash_attn_jax expects (n, l, h, d) format
+    # Our format is (B, H, T, D), so transpose axes 1 and 2
+    q_t = jnp.transpose(q, (0, 2, 1, 3))
+    k_t = jnp.transpose(k, (0, 2, 1, 3))
+    v_t = jnp.transpose(v, (0, 2, 1, 3))
+
+    out = flash_mha(q_t, k_t, v_t, is_causal=CAUSAL)
+    return jnp.transpose(out, (0, 2, 1, 3))
+
+
 # Flash Attention Forward
 
 def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, scale, num_k_blocks):
@@ -463,6 +484,13 @@ if __name__ == "__main__":
     o_cudnn_ref = cudnn_attention(q, k, v)
     o_flash, logsumexp_flash = flash_attention_fwd(q, k, v)
 
+    # Test nshepperd/flash_attn_jax reference (skip in INTERPRET_MODE)
+    if not INTERPRET_MODE:
+        o_flash_attn_jax = flash_attn_jax_wrapper(q, k, v)
+        assert jnp.allclose(o_flash_attn_jax, o_ref, atol=1e-1, rtol=1e-2), \
+            f"flash_attn_jax max diff: {jnp.max(jnp.abs(o_flash_attn_jax - o_ref))}"
+        print("flash_attn_jax reference check passed!")
+
     assert jnp.allclose(o_cudnn_ref, o_ref, atol=1e-1, rtol=1e-2),f"o max diff: {jnp.max(jnp.abs(o_cudnn_ref - o_ref))}"
     assert jnp.allclose(o_flash, o_ref, atol=1e-1, rtol=1e-2), f"o max diff: {jnp.max(jnp.abs(o_flash - o_ref))}"
     assert jnp.allclose(logsumexp_flash, logsumexp_ref, atol=1e-2, rtol=1e-2), f"logsumexp max diff: {jnp.max(jnp.abs(logsumexp_flash - logsumexp_ref))}"
@@ -524,11 +552,14 @@ if __name__ == "__main__":
     jax_fwd = jax.jit(cudnn_attention)
     flash_fwd = jax.jit(flash_attention)
     ref_fwd = jax.jit(mha_reference)
+    flash_attn_jax_fwd = jax.jit(flash_attn_jax_wrapper) if not INTERPRET_MODE else None
 
     # Get vjp functions for backward pass
     _, jax_vjp = jax.vjp(cudnn_attention, q_bench, k_bench, v_bench)
     _, flash_vjp = jax.vjp(flash_attention, q_bench, k_bench, v_bench)
     _, ref_vjp = jax.vjp(mha_reference, q_bench, k_bench, v_bench)
+    if not INTERPRET_MODE:
+        _, flash_attn_jax_vjp = jax.vjp(flash_attn_jax_wrapper, q_bench, k_bench, v_bench)
 
     print("\nForward pass:")
     t_jax = _bench(lambda: jax_fwd(q_bench, k_bench, v_bench))
@@ -537,6 +568,9 @@ if __name__ == "__main__":
     print(f"  Our flash_attention:       {t_ours:.3f} ms")
     t_ref = _bench(lambda: ref_fwd(q_bench, k_bench, v_bench))
     print(f"  Reference (materialized):  {t_ref:.3f} ms")
+    if not INTERPRET_MODE:
+        t_flash_attn_jax = _bench(lambda: flash_attn_jax_fwd(q_bench, k_bench, v_bench))
+        print(f"  flash_attn_jax (C++ CUDA):  {t_flash_attn_jax:.3f} ms")
 
     print("\nBackward pass only:")
     t_jax_bwd = _bench(lambda: jax_vjp(do_bench))
@@ -545,8 +579,13 @@ if __name__ == "__main__":
     print(f"  Our flash_attention:       {t_ours_bwd:.3f} ms")
     t_ref_bwd = _bench(lambda: ref_vjp(do_bench))
     print(f"  Reference (materialized):  {t_ref_bwd:.3f} ms")
+    if not INTERPRET_MODE:
+        t_flash_attn_jax_bwd = _bench(lambda: flash_attn_jax_vjp(do_bench))
+        print(f"  flash_attn_jax (C++ CUDA):  {t_flash_attn_jax_bwd:.3f} ms")
 
     print("\nTotal (Forward + Backward):")
     print(f"  JAX dot_product_attention: {t_jax + t_jax_bwd:.3f} ms")
     print(f"  Our flash_attention:       {t_ours + t_ours_bwd:.3f} ms")
     print(f"  Reference (materialized):  {t_ref + t_ref_bwd:.3f} ms")
+    if not INTERPRET_MODE:
+        print(f"  flash_attn_jax (C++ CUDA):  {t_flash_attn_jax + t_flash_attn_jax_bwd:.3f} ms")
