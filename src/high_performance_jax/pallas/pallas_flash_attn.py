@@ -170,7 +170,8 @@ def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, sca
         def skip_block(_):
             return (max_reg, l_reg, o_reg)
 
-        return jax.lax.cond(kv_idx.at[0] > q_idx.at[-1], skip_block, compute_block, None)
+        # Skip if KV block is entirely after Q block (causal attention optimization)
+        return jax.lax.cond(t > blk_idx, skip_block, compute_block, None)
 
     num_body = num_body_causal if CAUSAL else num_body_noncausal
     max_reg, l_reg, o_reg = jax.lax.fori_loop(0, num_k_blocks, num_body, (max_reg, l_reg, o_reg))
