@@ -29,6 +29,7 @@ gpu = [
     "jax[cuda12]==0.8.1",
     "triton>=3.3.0 ; sys_platform == 'linux'",
     "nvidia-cusparse>=12.7.2.19",
+    "flash-attn-jax",
 ]
 tpu = [
     "libtpu",

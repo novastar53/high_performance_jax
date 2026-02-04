@@ -178,3 +178,6 @@ traces/
 
 # NVIDIA Nsight profiles
 nsight_profiles/
+
+# Remote execution logs
+remote_logs/
