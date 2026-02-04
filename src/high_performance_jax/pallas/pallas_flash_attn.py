@@ -46,7 +46,7 @@ NUM_WARPS = 4
 NUM_STAGES = 3
 DTYPE = jnp.bfloat16
 JAX_SDPA_IMPL = "cudnn"
-CAUSAL = True
+CAUSAL = False
 
 if INTERPRET_MODE:
     JAX_SDPA_IMPL = "xla"
