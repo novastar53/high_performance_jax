@@ -38,7 +38,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
 
-INTERPRET_MODE = False  # Set to False on GPU
+INTERPRET_MODE = True  # Set to False on GPU
 
 BLOCK_R = 64
 BLOCK_C = 64
@@ -170,7 +170,6 @@ def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, sca
         def skip_block(_):
             return (max_reg, l_reg, o_reg)
 
-        # Skip if KV block is entirely after Q block (causal attention optimization)
         return jax.lax.cond(t > blk_idx, skip_block, compute_block, None)
 
     num_body = num_body_causal if CAUSAL else num_body_noncausal
@@ -282,24 +281,53 @@ def flash_attention_bwd_dkv_kernel(
     """
     k_reg = plgpu.load(k_ref.at[0, :, :])
     v_reg = plgpu.load(v_ref.at[0, :, :])
+    kv_blk_idx = pl.program_id(1)
+    kv_idx = BLOCK_C * kv_blk_idx + jnp.arange(BLOCK_C)
 
     dk_acc = jnp.zeros(dk_ref.shape, dtype=jnp.float32)
     dv_acc = jnp.zeros(dv_ref.shape, dtype=jnp.float32)
-    def body(t, carry):
+
+    def body_noncausal(t, carry):
         dk_acc, dv_acc = carry
         idx = pl.dslice(t * BLOCK_R, BLOCK_R)
         q_blk = plgpu.load(q_ref.at[0, idx, :])
         do_blk = plgpu.load(do_ref.at[0, idx, :])
         logsumexp_blk = plgpu.load(logsumexp_ref.at[0, idx])
         d_blk = plgpu.load(d_ref.at[0, idx])
-        s_blk = pl.dot(q_blk, k_reg, trans_b=True) / scale
+        s_blk = pl.dot(q_blk, k_reg, trans_b=True, precision='float32') / scale
         p_blk = jnp.exp(s_blk - logsumexp_blk[..., None])
         dp_blk = pl.dot(do_blk, v_reg, trans_b=True)
         ds_blk = p_blk * (dp_blk - d_blk[..., None]) / scale
         dv_acc += pl.dot(p_blk.astype(do_blk.dtype), do_blk, trans_a=True)
         dk_acc += pl.dot(ds_blk.astype(q_blk.dtype), q_blk, trans_a=True)
-        return dk_acc, dv_acc
-        
+        return (dk_acc, dv_acc)
+
+    def body_causal(t, carry):
+        dk_acc, dv_acc = carry
+        idx = pl.dslice(t * BLOCK_R, BLOCK_R)
+        q_blk = plgpu.load(q_ref.at[0, idx, :])
+        do_blk = plgpu.load(do_ref.at[0, idx, :])
+        logsumexp_blk = plgpu.load(logsumexp_ref.at[0, idx])
+        d_blk = plgpu.load(d_ref.at[0, idx])
+        q_idx = BLOCK_R * t + jnp.arange(BLOCK_R)
+
+        def compute_block(_):
+            s_blk = pl.dot(q_blk, k_reg, trans_b=True, precision='float32') / scale
+            mask = kv_idx[None, :] > q_idx[:, None]
+            s_blk = jnp.where(mask, -jnp.inf, s_blk)
+            p_blk = jnp.exp(s_blk - logsumexp_blk[..., None])
+            dp_blk = pl.dot(do_blk, v_reg, trans_b=True)
+            ds_blk = p_blk * (dp_blk - d_blk[..., None]) / scale
+            dv_new = dv_acc + pl.dot(p_blk.astype(do_blk.dtype), do_blk, trans_a=True)
+            dk_new = dk_acc + pl.dot(ds_blk.astype(q_blk.dtype), q_blk, trans_a=True)
+            return (dk_new, dv_new)
+
+        def skip_block(_):
+            return (dk_acc, dv_acc)
+
+        return jax.lax.cond(t < kv_blk_idx, skip_block, compute_block, None)
+
+    body = body_causal if CAUSAL else body_noncausal
     dk_acc, dv_acc = jax.lax.fori_loop(0, num_q_blocks, body, (dk_acc, dv_acc))
     plgpu.store(dk_ref, dk_acc.astype(dk_ref.dtype))
     plgpu.store(dv_ref, dv_acc.astype(dv_ref.dtype))
@@ -342,7 +370,7 @@ def flash_attention_bwd_dkv(q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_f
 def flash_attention_bwd_dq_kernel(
     q_ref, k_ref, v_ref, do_ref, logsumexp_ref, d_ref,
     dq_ref,
-    *, scale, num_kv_blocks 
+    *, scale, num_kv_blocks
 ):
     """Compute dQ gradient.
 
@@ -357,18 +385,45 @@ def flash_attention_bwd_dq_kernel(
     do_reg = plgpu.load(do_ref.at[0, :, :])
     logsumexp_reg = plgpu.load(logsumexp_ref.at[0, :])
     d_reg = plgpu.load(d_ref.at[0, :])
+    q_blk_idx = pl.program_id(1)
+    q_idx = BLOCK_R * q_blk_idx + jnp.arange(BLOCK_R)
     dq_acc = jnp.zeros(dq_ref.shape, dtype=jnp.float32)  # Use float32 for numerical stability
-    def body(t, carry):
+
+    def body_noncausal(t, carry):
         dq_acc = carry
         idx = pl.dslice(t * BLOCK_C, BLOCK_C)
         k_blk = plgpu.load(k_ref.at[0, idx, :])
         v_blk = plgpu.load(v_ref.at[0, idx, :])
-        s_blk = pl.dot(q_reg, k_blk, trans_b=True) / scale
+        s_blk = pl.dot(q_reg, k_blk, trans_b=True, precision='float32') / scale
         p_blk = jnp.exp(s_blk - logsumexp_reg[..., None])
         dp_blk = pl.dot(do_reg, v_blk, trans_b=True)
-        ds_blk = p_blk * ( dp_blk - d_reg[..., None] ) / scale
+        ds_blk = p_blk * (dp_blk - d_reg[..., None]) / scale
         dq_acc += pl.dot(ds_blk.astype(k_blk.dtype), k_blk)
         return dq_acc
+
+    def body_causal(t, carry):
+        dq_acc = carry
+        idx = pl.dslice(t * BLOCK_C, BLOCK_C)
+        k_blk = plgpu.load(k_ref.at[0, idx, :])
+        v_blk = plgpu.load(v_ref.at[0, idx, :])
+        kv_idx = BLOCK_C * t + jnp.arange(BLOCK_C)
+
+        def compute_block(_):
+            s_blk = pl.dot(q_reg, k_blk, trans_b=True, precision='float32') / scale
+            mask = kv_idx[None, :] > q_idx[:, None]
+            s_blk = jnp.where(mask, -jnp.inf, s_blk)
+            p_blk = jnp.exp(s_blk - logsumexp_reg[..., None])
+            dp_blk = pl.dot(do_reg, v_blk, trans_b=True)
+            ds_blk = p_blk * (dp_blk - d_reg[..., None]) / scale
+            dq_new = dq_acc + pl.dot(ds_blk.astype(k_blk.dtype), k_blk)
+            return dq_new
+
+        def skip_block(_):
+            return dq_acc
+
+        return jax.lax.cond(t > q_blk_idx, skip_block, compute_block, None)
+
+    body = body_causal if CAUSAL else body_noncausal
     dq_acc = jax.lax.fori_loop(0, num_kv_blocks, body, dq_acc)
     plgpu.store(dq_ref, dq_acc.astype(dq_ref.dtype))
 
@@ -488,12 +543,12 @@ if __name__ == "__main__":
     # Test nshepperd/flash_attn_jax reference (skip in INTERPRET_MODE)
     if not INTERPRET_MODE:
         o_flash_attn_jax = flash_attn_jax_wrapper(q, k, v)
-        assert jnp.allclose(o_flash_attn_jax, o_ref, atol=1e-1, rtol=1e-2), \
+        assert jnp.allclose(o_flash_attn_jax, o_ref, atol=1e-2, rtol=1e-2), \
             f"flash_attn_jax max diff: {jnp.max(jnp.abs(o_flash_attn_jax - o_ref))}"
         print("flash_attn_jax reference check passed!")
 
-    assert jnp.allclose(o_cudnn_ref, o_ref, atol=1e-1, rtol=1e-2),f"o max diff: {jnp.max(jnp.abs(o_cudnn_ref - o_ref))}"
-    assert jnp.allclose(o_flash, o_ref, atol=1e-1, rtol=1e-2), f"o max diff: {jnp.max(jnp.abs(o_flash - o_ref))}"
+    assert jnp.allclose(o_cudnn_ref, o_ref, atol=1e-2, rtol=1e-2),f"o max diff: {jnp.max(jnp.abs(o_cudnn_ref - o_ref))}"
+    assert jnp.allclose(o_flash, o_ref, atol=1e-2, rtol=1e-2), f"o max diff: {jnp.max(jnp.abs(o_flash - o_ref))}"
     assert jnp.allclose(logsumexp_flash, logsumexp_ref, atol=1e-2, rtol=1e-2), f"logsumexp max diff: {jnp.max(jnp.abs(logsumexp_flash - logsumexp_ref))}"
     print("Forward pass check passed!")
 
@@ -503,90 +558,93 @@ if __name__ == "__main__":
 
     dq_ref, dk_ref, dv_ref = jax.grad(loss_ref, argnums=(0, 1, 2))(q, k, v)
     # Test preprocess kernel: D = rowsum(O * dO)
-    d_ref = jnp.sum((o_flash * do).astype(jnp.float32), axis=-1).astype(DTYPE)  # (B, H, T)
-    o_flat = o_flash.reshape(-1, T, D)
+    # Use reference output for ground truth to avoid compounding bfloat16 errors
+    d_ref = jnp.sum((o_ref * do).astype(jnp.float32), axis=-1).astype(DTYPE)  # (B, H, T)
+    o_flat = o_ref.reshape(-1, T, D)
     do_flat = do.reshape(-1, T, D)
     d_flash = flash_attention_bwd_preprocess(o_flat, do_flat).reshape(B, H, T)
+
+    # For bfloat16, we need looser tolerance due to precision limits
+    # 0.0625 = 2^-4 is the expected precision error for accumulated sums
     assert jnp.allclose(d_flash, d_ref, atol=1e-2, rtol=1e-2), f"D max diff: {jnp.max(jnp.abs(d_flash - d_ref))}"
     print("Preprocess kernel (D) check passed!")
 
-    # Test backward pass (dQ only for now, dK/dV return dummy zeros)
+    # Test backward pass
     dq_flash, dk_flash, dv_flash = flash_attention_bwd(q, k, v, o_flash, logsumexp_flash, do)
     assert jnp.allclose(dq_flash, dq_ref, atol=1e-2, rtol=1e-2), f"dQ max diff: {jnp.max(jnp.abs(dq_flash - dq_ref))}"
-    print("dQ check passed!")
-
     assert jnp.allclose(dk_flash, dk_ref, atol=1e-2, rtol=1e-2), f"dK max diff: {jnp.max(jnp.abs(dk_flash - dk_ref))}"
     assert jnp.allclose(dv_flash, dv_ref, atol=1e-2, rtol=1e-2), f"dV max diff: {jnp.max(jnp.abs(dv_flash - dv_ref))}"
     print("Backward pass check passed!")
 
-    # Timing comparison with JAX built-in dot_product_attention
-    print("\n" + "="*60)
-    print("Timing Comparison")
-    print("="*60)
-
-    # Use larger sizes for meaningful timing
-    # Use bfloat16 for cuDNN compatibility
-    B_bench, H_bench, T_bench, D_bench = 4, 8, 4096, 64
-    q_bench = jax.random.normal(keys[0], (B_bench, H_bench, T_bench, D_bench), dtype=DTYPE)
-    k_bench = jax.random.normal(keys[1], (B_bench, H_bench, T_bench, D_bench), dtype=DTYPE)
-    v_bench = jax.random.normal(keys[2], (B_bench, H_bench, T_bench, D_bench), dtype=DTYPE)
-    do_bench = jax.random.normal(keys[3], (B_bench, H_bench, T_bench, D_bench), dtype=DTYPE)
-
-    print(f"Benchmark shape: B={B_bench}, H={H_bench}, T={T_bench}, D={D_bench}")
-
-    def _bench(fn, warmup=3, iters=20):
-        """Benchmark a function."""
-        # Warmup
-        for _ in range(warmup):
-            out = fn()
-            jax.block_until_ready(out)
-        # Bench
-        times = []
-        for _ in range(iters):
-            t0 = time.perf_counter()
-            out = fn()
-            jax.block_until_ready(out)
-            times.append(time.perf_counter() - t0)
-        return np.median(times) * 1000
-
-    # Create jitted forward functions
-    jax_fwd = jax.jit(cudnn_attention)
-    flash_fwd = jax.jit(flash_attention)
-    ref_fwd = jax.jit(mha_reference)
-    flash_attn_jax_fwd = jax.jit(flash_attn_jax_wrapper) if not INTERPRET_MODE else None
-
-    # Get vjp functions for backward pass
-    _, jax_vjp = jax.vjp(cudnn_attention, q_bench, k_bench, v_bench)
-    _, flash_vjp = jax.vjp(flash_attention, q_bench, k_bench, v_bench)
-    _, ref_vjp = jax.vjp(mha_reference, q_bench, k_bench, v_bench)
     if not INTERPRET_MODE:
-        _, flash_attn_jax_vjp = jax.vjp(flash_attn_jax_wrapper, q_bench, k_bench, v_bench)
+        # Timing comparison with JAX built-in dot_product_attention
+        print("\n" + "="*60)
+        print("Timing Comparison")
+        print("="*60)
 
-    print("\nForward pass:")
-    t_jax = _bench(lambda: jax_fwd(q_bench, k_bench, v_bench))
-    print(f"  JAX dot_product_attention: {t_jax:.3f} ms")
-    t_ours = _bench(lambda: flash_fwd(q_bench, k_bench, v_bench))
-    print(f"  Our flash_attention:       {t_ours:.3f} ms")
-    t_ref = _bench(lambda: ref_fwd(q_bench, k_bench, v_bench))
-    print(f"  Reference (materialized):  {t_ref:.3f} ms")
-    if not INTERPRET_MODE:
-        t_flash_attn_jax = _bench(lambda: flash_attn_jax_fwd(q_bench, k_bench, v_bench))
-        print(f"  flash_attn_jax (C++ CUDA):  {t_flash_attn_jax:.3f} ms")
+        # Use larger sizes for meaningful timing
+        # Use bfloat16 for cuDNN compatibility
+        B_bench, H_bench, T_bench, D_bench = 4, 8, 4096, 64
+        q_bench = jax.random.normal(keys[0], (B_bench, H_bench, T_bench, D_bench), dtype=DTYPE)
+        k_bench = jax.random.normal(keys[1], (B_bench, H_bench, T_bench, D_bench), dtype=DTYPE)
+        v_bench = jax.random.normal(keys[2], (B_bench, H_bench, T_bench, D_bench), dtype=DTYPE)
+        do_bench = jax.random.normal(keys[3], (B_bench, H_bench, T_bench, D_bench), dtype=DTYPE)
 
-    print("\nBackward pass only:")
-    t_jax_bwd = _bench(lambda: jax_vjp(do_bench))
-    print(f"  JAX dot_product_attention: {t_jax_bwd:.3f} ms")
-    t_ours_bwd = _bench(lambda: flash_vjp(do_bench))
-    print(f"  Our flash_attention:       {t_ours_bwd:.3f} ms")
-    t_ref_bwd = _bench(lambda: ref_vjp(do_bench))
-    print(f"  Reference (materialized):  {t_ref_bwd:.3f} ms")
-    if not INTERPRET_MODE:
-        t_flash_attn_jax_bwd = _bench(lambda: flash_attn_jax_vjp(do_bench))
-        print(f"  flash_attn_jax (C++ CUDA):  {t_flash_attn_jax_bwd:.3f} ms")
+        print(f"Benchmark shape: B={B_bench}, H={H_bench}, T={T_bench}, D={D_bench}")
 
-    print("\nTotal (Forward + Backward):")
-    print(f"  JAX dot_product_attention: {t_jax + t_jax_bwd:.3f} ms")
-    print(f"  Our flash_attention:       {t_ours + t_ours_bwd:.3f} ms")
-    print(f"  Reference (materialized):  {t_ref + t_ref_bwd:.3f} ms")
-    if not INTERPRET_MODE:
-        print(f"  flash_attn_jax (C++ CUDA):  {t_flash_attn_jax + t_flash_attn_jax_bwd:.3f} ms")
+        def _bench(fn, warmup=3, iters=20):
+            """Benchmark a function."""
+            # Warmup
+            for _ in range(warmup):
+                out = fn()
+                jax.block_until_ready(out)
+            # Bench
+            times = []
+            for _ in range(iters):
+                t0 = time.perf_counter()
+                out = fn()
+                jax.block_until_ready(out)
+                times.append(time.perf_counter() - t0)
+            return np.median(times) * 1000
+
+        # Create jitted forward functions
+        jax_fwd = jax.jit(cudnn_attention)
+        flash_fwd = jax.jit(flash_attention)
+        ref_fwd = jax.jit(mha_reference)
+        flash_attn_jax_fwd = jax.jit(flash_attn_jax_wrapper) if not INTERPRET_MODE else None
+
+        # Get vjp functions for backward pass
+        _, jax_vjp = jax.vjp(cudnn_attention, q_bench, k_bench, v_bench)
+        _, flash_vjp = jax.vjp(flash_attention, q_bench, k_bench, v_bench)
+        _, ref_vjp = jax.vjp(mha_reference, q_bench, k_bench, v_bench)
+        if not INTERPRET_MODE:
+            _, flash_attn_jax_vjp = jax.vjp(flash_attn_jax_wrapper, q_bench, k_bench, v_bench)
+
+        print("\nForward pass:")
+        t_jax = _bench(lambda: jax_fwd(q_bench, k_bench, v_bench))
+        print(f"  JAX dot_product_attention: {t_jax:.3f} ms")
+        t_ours = _bench(lambda: flash_fwd(q_bench, k_bench, v_bench))
+        print(f"  Our flash_attention:       {t_ours:.3f} ms")
+        t_ref = _bench(lambda: ref_fwd(q_bench, k_bench, v_bench))
+        print(f"  Reference (materialized):  {t_ref:.3f} ms")
+        if not INTERPRET_MODE:
+            t_flash_attn_jax = _bench(lambda: flash_attn_jax_fwd(q_bench, k_bench, v_bench))
+            print(f"  flash_attn_jax (C++ CUDA):  {t_flash_attn_jax:.3f} ms")
+
+        print("\nBackward pass only:")
+        t_jax_bwd = _bench(lambda: jax_vjp(do_bench))
+        print(f"  JAX dot_product_attention: {t_jax_bwd:.3f} ms")
+        t_ours_bwd = _bench(lambda: flash_vjp(do_bench))
+        print(f"  Our flash_attention:       {t_ours_bwd:.3f} ms")
+        t_ref_bwd = _bench(lambda: ref_vjp(do_bench))
+        print(f"  Reference (materialized):  {t_ref_bwd:.3f} ms")
+        if not INTERPRET_MODE:
+            t_flash_attn_jax_bwd = _bench(lambda: flash_attn_jax_vjp(do_bench))
+            print(f"  flash_attn_jax (C++ CUDA):  {t_flash_attn_jax_bwd:.3f} ms")
+
+        print("\nTotal (Forward + Backward):")
+        print(f"  JAX dot_product_attention: {t_jax + t_jax_bwd:.3f} ms")
+        print(f"  Our flash_attention:       {t_ours + t_ours_bwd:.3f} ms")
+        print(f"  Reference (materialized):  {t_ref + t_ref_bwd:.3f} ms")
+        if not INTERPRET_MODE:
+            print(f"  flash_attn_jax (C++ CUDA):  {t_flash_attn_jax + t_flash_attn_jax_bwd:.3f} ms")
