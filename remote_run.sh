@@ -126,8 +126,9 @@ set -e
 
 # Expand REMOTE_DIR
 REMOTE_DIR_EXPANDED=$(eval echo ~/high_performance_jax)
+PARENT_DIR=$(dirname "$REMOTE_DIR_EXPANDED")
 
-# Clone or update repo
+# Clone or update main repo
 if [ -d "$REMOTE_DIR_EXPANDED" ]; then
     echo "Updating existing repo..."
     cd "$REMOTE_DIR_EXPANDED"
@@ -135,8 +136,22 @@ if [ -d "$REMOTE_DIR_EXPANDED" ]; then
     git pull origin main
 else
     echo "Cloning repo..."
+    mkdir -p "$PARENT_DIR"
     git clone https://github.com/novastar53/high_performance_jax.git "$REMOTE_DIR_EXPANDED"
     cd "$REMOTE_DIR_EXPANDED"
+fi
+
+# Clone or update deepkit dependency (required sibling directory)
+DEEPKIT_DIR="$PARENT_DIR/deepkit"
+if [ -d "$DEEPKIT_DIR" ]; then
+    echo "Updating deepkit dependency..."
+    cd "$DEEPKIT_DIR"
+    git fetch origin
+    git pull origin main
+else
+    echo "Cloning deepkit dependency..."
+    mkdir -p "$PARENT_DIR"
+    git clone https://github.com/novastar53/deepkit "$DEEPKIT_DIR"
 fi
 
 # Create log directory
