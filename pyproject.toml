@@ -30,6 +30,7 @@ gpu = [
     "triton>=3.3.0 ; sys_platform == 'linux'",
     "nvidia-cusparse>=12.7.2.19",
     "flash-attn-jax",
+    "einops",
 ]
 tpu = [
     "libtpu",
