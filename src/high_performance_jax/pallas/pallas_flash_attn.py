@@ -61,7 +61,6 @@ NUM_STAGES = _args.num_stages
 DTYPE = jnp.bfloat16
 JAX_SDPA_IMPL = "cudnn"
 CAUSAL = _args.causal
-LOG2E = math.log2(math.e)  # ~1.4427, for exp2 optimization
 
 if INTERPRET_MODE:
     JAX_SDPA_IMPL = "xla"
@@ -139,14 +138,9 @@ def flash_attn_jax_wrapper(q, k, v):
 # Flash Attention Forward
 
 def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, qk_scale, num_k_blocks):
-    """Flash attention forward kernel.
-
-    Uses exp2 with log2(e) scaling for faster GPU execution.
-    All internal max values are kept in log2 domain.
-    """
+    """Flash attention forward kernel."""
     q_reg = plgpu.load(q_ref.at[0, :, :])
     o_reg = jnp.zeros(q_reg.shape, jnp.float32)
-    # max_reg is in log2 domain (scaled by log2(e))
     max_reg = jnp.full((BLOCK_R,), -jnp.inf, dtype=jnp.float32)
     l_reg = jnp.zeros((BLOCK_R,), dtype=jnp.float32)
 
@@ -160,9 +154,7 @@ def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, qk_
         v_blk = plgpu.load(v_ref.at[0, idx, :])
 
         def compute_block(_):
-            # qk_scale = log2(e) / sqrt(d), so s_blk is in log2 domain
             s_blk = pl.dot(q_reg, k_blk, trans_b=True, precision='float32') * qk_scale
-            # Apply causal mask for partial blocks
             if CAUSAL:
                 kv_idx = BLOCK_C * t + jnp.arange(BLOCK_C)
                 causal_mask = kv_idx[None, :] > q_idx[:, None]
@@ -170,12 +162,10 @@ def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, qk_
             else:
                 s_blk_masked = s_blk
             max_blk = jnp.maximum(max_reg, jnp.max(s_blk_masked, axis=-1))
-            # exp2 is faster than exp on GPU
-            p_blk = jnp.exp2(s_blk_masked - max_blk[:, None])
+            p_blk = jnp.exp(s_blk_masked - max_blk[:, None])
             l_blk = jnp.sum(p_blk, axis=-1)
             o_blk = pl.dot(p_blk.astype(v_blk.dtype), v_blk)
-            # Correction factor also uses exp2 since max is in log2 domain
-            alpha = jnp.exp2(max_reg - max_blk)
+            alpha = jnp.exp(max_reg - max_blk)
             return (max_blk,
                     l_reg * alpha + l_blk,
                     o_reg * alpha[:, None] + o_blk)
@@ -190,9 +180,7 @@ def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, qk_
             return compute_block(None)
 
     max_reg, l_reg, o_reg = jax.lax.fori_loop(0, num_k_blocks, body, (max_reg, l_reg, o_reg))
-    # Store logsumexp in log2 domain to avoid conversion overhead in backward
-    # logsumexp_log2 = max + log2(l) where max is already in log2 domain
-    logsumexp_reg = max_reg + jnp.log2(l_reg)
+    logsumexp_reg = max_reg + jnp.log(l_reg)
     o_reg = o_reg / l_reg[:, None]
     plgpu.store(o_ref.at[0, :, :], o_reg.astype(o_ref.dtype))
     plgpu.store(logsumexp_ref.at[0, :], logsumexp_reg.astype(logsumexp_ref.dtype))
@@ -207,8 +195,7 @@ def flash_attention_fwd(q, k, v):
     q_flat = q.reshape(-1, T, C)
     k_flat = k.reshape(-1, T, C)
     v_flat = v.reshape(-1, T, C)
-    # qk_scale combines softmax scaling with log2(e) for exp2 optimization
-    qk_scale = LOG2E / math.sqrt(C)
+    qk_scale = 1.0 / math.sqrt(C)
     num_k_blocks = pl.cdiv(T, BLOCK_C)
     grid = (B_flat, pl.cdiv(T, BLOCK_R))
 
@@ -297,8 +284,6 @@ def flash_attention_bwd_dkv_kernel(
     For each KV block, we accumulate:
         dV += P^T @ dO
         dK += dS^T @ Q  (where dS = P ⊙ (dP - D))
-
-    Uses exp2 with log2(e) scaling for faster GPU execution.
     """
     k_reg = plgpu.load(k_ref.at[0, :, :])
     v_reg = plgpu.load(v_ref.at[0, :, :])
@@ -317,16 +302,14 @@ def flash_attention_bwd_dkv_kernel(
         d_blk = plgpu.load(d_ref.at[0, idx])
 
         def compute_block(_):
-            # Both s_blk and logsumexp are in log2 domain
             s_blk = pl.dot(q_blk, k_reg, trans_b=True, precision='float32') * qk_scale
-            # Apply causal mask for partial blocks
             if CAUSAL:
                 q_idx = BLOCK_R * t + jnp.arange(BLOCK_R)
                 causal_mask = kv_idx[None, :] > q_idx[:, None]
                 s_blk_masked = jnp.where(causal_mask, -jnp.inf, s_blk)
             else:
                 s_blk_masked = s_blk
-            p_blk = jnp.exp2(s_blk_masked - logsumexp_blk[..., None])
+            p_blk = jnp.exp(s_blk_masked - logsumexp_blk[..., None])
             dp_blk = pl.dot(do_blk, v_reg, trans_b=True)
             ds_blk = p_blk * (dp_blk - d_blk[..., None]) * softmax_scale
             dv_new = dv_acc + pl.dot(p_blk.astype(do_blk.dtype), do_blk, trans_a=True)
@@ -394,8 +377,6 @@ def flash_attention_bwd_dq_kernel(
 
     For each Q block, we accumulate:
         dQ += dS @ K  (where dS = P ⊙ (dP - D))
-
-    Uses exp2 with log2(e) scaling for faster GPU execution.
     """
     q_reg = plgpu.load(q_ref.at[0, :, :])
     do_reg = plgpu.load(do_ref.at[0, :, :])
@@ -412,16 +393,14 @@ def flash_attention_bwd_dq_kernel(
         v_blk = plgpu.load(v_ref.at[0, idx, :])
 
         def compute_block(_):
-            # Both s_blk and logsumexp are in log2 domain
             s_blk = pl.dot(q_reg, k_blk, trans_b=True, precision='float32') * qk_scale
-            # Apply causal mask for partial blocks
             if CAUSAL:
                 kv_idx = BLOCK_C * t + jnp.arange(BLOCK_C)
                 causal_mask = kv_idx[None, :] > q_idx[:, None]
                 s_blk_masked = jnp.where(causal_mask, -jnp.inf, s_blk)
             else:
                 s_blk_masked = s_blk
-            p_blk = jnp.exp2(s_blk_masked - logsumexp_reg[..., None])
+            p_blk = jnp.exp(s_blk_masked - logsumexp_reg[..., None])
             dp_blk = pl.dot(do_reg, v_blk, trans_b=True)
             ds_blk = p_blk * (dp_blk - d_reg[..., None]) * softmax_scale
             dq_new = dq_acc + pl.dot(ds_blk.astype(k_blk.dtype), k_blk)
@@ -472,9 +451,7 @@ def flash_attention_bwd_dq(q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_fl
 def flash_attention_bwd(q, k, v, o, logsumexp, do):
     """Flash attention backward pass using 3 separate kernels."""
     B, H, T, C = q.shape
-    # qk_scale for exp2 optimization (log2(e) / sqrt(d))
-    qk_scale = LOG2E / math.sqrt(C)
-    # softmax_scale for gradient computation (1 / sqrt(d))
+    qk_scale = 1.0 / math.sqrt(C)
     softmax_scale = 1.0 / math.sqrt(C)
 
     # Flatten batch and head dimensions
@@ -581,9 +558,7 @@ if __name__ == "__main__":
 
     assert jnp.allclose(o_cudnn_ref, o_ref, atol=1e-1, rtol=1e-2),f"o max diff: {jnp.max(jnp.abs(o_cudnn_ref - o_ref))}"
     assert jnp.allclose(o_flash, o_ref, atol=1e-1, rtol=1e-2), f"o max diff: {jnp.max(jnp.abs(o_flash - o_ref))}"
-    # logsumexp_flash is in log2 domain, convert logsumexp_ref to log2 for comparison
-    logsumexp_ref_log2 = logsumexp_ref * LOG2E
-    assert jnp.allclose(logsumexp_flash, logsumexp_ref_log2, atol=1e-2, rtol=1e-2), f"logsumexp max diff: {jnp.max(jnp.abs(logsumexp_flash - logsumexp_ref_log2))}"
+    assert jnp.allclose(logsumexp_flash, logsumexp_ref, atol=1e-2, rtol=1e-2), f"logsumexp max diff: {jnp.max(jnp.abs(logsumexp_flash - logsumexp_ref))}"
     print("Forward pass check passed!")
 
     # Backward check (reference)
