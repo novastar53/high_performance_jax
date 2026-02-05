@@ -9,22 +9,6 @@ Input shapes: Q, K, V are (B, H, T, D) where:
 Standard attention computes:
 Attention(Q, K, V) = softmax(Q @ K.T / sqrt(d)) @ V
 
-Causal attention masks future positions (for autoregressive models).
-
-This normally requires materializing the full N×N attention matrix. Flash attention avoids this by:
-
-1. Computing Q·Kᵀ tiles on-the-fly: Instead of loading pre-computed attention scores, compute S_tile = Q_block @ K_block.T / sqrt(d) inside your column loop (where you currently load x_tile).
-2. Accumulating the output with V using online correction: Just as you correct l_reg when the max changes (l_reg * exp(max_old - max_new)), you need to apply the same correction to a running output accumulator:
-O_acc = O_acc * exp(m_old - m_new) + P_tile @ V_block
-2. where P_tile = exp(S_tile - m_new).
-3. Final normalization: After all K/V blocks are processed, divide by l_reg to get the final output.
-
-The kernel structure would be similar to your softmax kernel, but:
-- Input refs: Q, K, V (instead of just x)
-- The inner loop computes the matmul Q_block @ K_block.T rather than loading from a pre-computed matrix
-- You maintain an output accumulator O_acc that gets rescaled alongside l_reg
-- Output is O_acc / l_reg
-
 This keeps memory usage at O(N) instead of O(N²) since you never store the full attention matrix.
 """
 from functools import partial
@@ -46,7 +30,7 @@ def _parse_global_args():
     parser.add_argument("--block-c", type=int, default=64, help="Block size C (KV cols)")
     parser.add_argument("--num-warps", type=int, default=4, help="Number of warps")
     parser.add_argument("--num-stages", type=int, default=3, help="Number of pipeline stages")
-    parser.add_argument("--causal", action="store_true", help="Use causal masking")
+    parser.add_argument("--window-size", type=str, default="-1,-1", help="Sliding window as 'left,right' tuple (e.g., '-1,0' for causal, '64,64' for bidirectional)")
     parser.add_argument("--interpret-mode", action="store_true", help="Use Pallas interpreter mode")
     args, _ = parser.parse_known_args()
     return args
@@ -58,9 +42,14 @@ BLOCK_R = _args.block_r
 BLOCK_C = _args.block_c
 NUM_WARPS = _args.num_warps
 NUM_STAGES = _args.num_stages
+WINDOW_SIZE = _args.window_size
+if _args.window_size:
+    parts = _args.window_size.split(',')
+    WINDOW_SIZE = (int(parts[0].strip()), int(parts[1].strip()))
+IS_CAUSAL = WINDOW_SIZE is not None and WINDOW_SIZE[1] == 0
+
 DTYPE = jnp.bfloat16
 JAX_SDPA_IMPL = "cudnn"
-CAUSAL = _args.causal
 
 if INTERPRET_MODE:
     JAX_SDPA_IMPL = "xla"
@@ -78,10 +67,19 @@ def mha_reference(q, k, v):
     """
     d = q.shape[-1]
     logits = jnp.einsum('bhqd,bhkd->bhqk', q, k) / math.sqrt(d)
-    if CAUSAL:
-        T = q.shape[2]
-        mask = jnp.triu(jnp.ones((T, T), dtype=jnp.bool_), k=1)
-        logits = jnp.where(mask, -jnp.inf, logits)
+    T = q.shape[2]
+    left, right = WINDOW_SIZE
+    left_limit = None if left == -1 else left
+    right_limit = None if right == -1 else right
+    if left_limit or right_limit:
+        q_idx = jnp.arange(T)
+        k_idx = jnp.arange(T)
+        mask = jnp.ones((T, T), dtype=jnp.bool_)
+        if left_limit is not None:
+            mask = mask & (q_idx[:, None] - left_limit <= k_idx[None, :])
+        if right_limit is not None:
+            mask = mask & (q_idx[:, None] + right_limit >= k_idx[None, :])
+        logits = jnp.where(mask, logits, -jnp.inf)
     probs = jax.nn.softmax(logits, axis=-1)
     return jnp.einsum('bhqk,bhkd->bhqd', probs, v)
 
@@ -90,10 +88,19 @@ def _compute_logsumexp(q, k):
     """Compute logsumexp of attention logits (for testing flash attention)."""
     d = q.shape[-1]
     logits = jnp.einsum('bhqd,bhkd->bhqk', q, k) / math.sqrt(d)
-    if CAUSAL:
-        T = q.shape[2]
-        mask = jnp.triu(jnp.ones((T, T), dtype=jnp.bool_), k=1)
-        logits = jnp.where(mask, -jnp.inf, logits)
+    T = q.shape[2]
+    left, right = WINDOW_SIZE
+    left_limit = None if left == -1 else left
+    right_limit = None if right == -1 else right
+    if left_limit or right_limit:
+        q_idx = jnp.arange(T)
+        k_idx = jnp.arange(T)
+        mask = jnp.ones((T, T), dtype=jnp.bool_)
+        if left_limit is not None:
+            mask = mask & (q_idx[:, None] - left_limit <= k_idx[None, :])
+        if right_limit is not None:
+            mask = mask & (q_idx[:, None] + right_limit >= k_idx[None, :])
+        logits = jnp.where(mask, logits, -jnp.inf)
     logits_max = jnp.max(logits, axis=-1)
     logits_shift = logits - logits_max[..., None]
     return logits_max + jnp.log(jnp.sum(jnp.exp(logits_shift), axis=-1))
@@ -110,7 +117,14 @@ def cudnn_attention(q, k, v):
     q_t = jnp.transpose(q, (0, 2, 1, 3))
     k_t = jnp.transpose(k, (0, 2, 1, 3))
     v_t = jnp.transpose(v, (0, 2, 1, 3))
-    out = jax.nn.dot_product_attention(q_t, k_t, v_t, implementation=JAX_SDPA_IMPL, is_causal=CAUSAL)
+    is_causal = (WINDOW_SIZE == (-1,0))
+    is_bidirectional = (WINDOW_SIZE == (-1,-1))
+    if is_causal:
+        out = jax.nn.dot_product_attention(q_t, k_t, v_t, implementation=JAX_SDPA_IMPL, is_causal=True)
+    elif is_bidirectional:
+        out = jax.nn.dot_product_attention(q_t, k_t, v_t, implementation=JAX_SDPA_IMPL, is_causal=False)
+    else:
+        out = jax.nn.dot_product_attention(q_t, k_t, v_t, implementation=JAX_SDPA_IMPL, local_window_size=WINDOW_SIZE)
     return jnp.transpose(out, (0, 2, 1, 3))  # Back to (B, H, T, D)
 
 
@@ -125,13 +139,16 @@ def flash_attn_jax_wrapper(q, k, v):
     """
     from flash_attn_jax import flash_mha
 
+    # Derive is_causal from WINDOW_SIZE: causal if right limit is 0
+    is_causal = WINDOW_SIZE is not None and WINDOW_SIZE[1] == 0
+
     # nshepperd/flash_attn_jax expects (n, l, h, d) format
     # Our format is (B, H, T, D), so transpose axes 1 and 2
     q_t = jnp.transpose(q, (0, 2, 1, 3))
     k_t = jnp.transpose(k, (0, 2, 1, 3))
     v_t = jnp.transpose(v, (0, 2, 1, 3))
 
-    out = flash_mha(q_t, k_t, v_t, is_causal=CAUSAL)
+    out = flash_mha(q_t, k_t, v_t, is_causal=is_causal)
     return jnp.transpose(out, (0, 2, 1, 3))
 
 
@@ -155,7 +172,7 @@ def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, qk_
 
         def compute_block(_):
             s_blk = pl.dot(q_reg, k_blk, trans_b=True, precision='float32') * qk_scale
-            if CAUSAL:
+            if IS_CAUSAL:
                 kv_idx = BLOCK_C * t + jnp.arange(BLOCK_C)
                 causal_mask = kv_idx[None, :] > q_idx[:, None]
                 s_blk_masked = jnp.where(causal_mask, -jnp.inf, s_blk)
@@ -174,7 +191,7 @@ def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, qk_
             return (max_reg, l_reg, o_reg)
 
         # For causal: skip KV blocks that are entirely masked (t > blk_idx)
-        if CAUSAL:
+        if IS_CAUSAL:
             return jax.lax.cond(t > blk_idx, skip_block, compute_block, None)
         else:
             return compute_block(None)
@@ -303,7 +320,7 @@ def flash_attention_bwd_dkv_kernel(
 
         def compute_block(_):
             s_blk = pl.dot(q_blk, k_reg, trans_b=True, precision='float32') * qk_scale
-            if CAUSAL:
+            if IS_CAUSAL:
                 q_idx = BLOCK_R * t + jnp.arange(BLOCK_R)
                 causal_mask = kv_idx[None, :] > q_idx[:, None]
                 s_blk_masked = jnp.where(causal_mask, -jnp.inf, s_blk)
@@ -320,7 +337,7 @@ def flash_attention_bwd_dkv_kernel(
             return (dk_acc, dv_acc)
 
         # For causal: skip Q blocks that can't see this KV block (t < kv_blk_idx)
-        if CAUSAL:
+        if IS_CAUSAL:
             return jax.lax.cond(t < kv_blk_idx, skip_block, compute_block, None)
         else:
             return compute_block(None)
@@ -394,7 +411,7 @@ def flash_attention_bwd_dq_kernel(
 
         def compute_block(_):
             s_blk = pl.dot(q_reg, k_blk, trans_b=True, precision='float32') * qk_scale
-            if CAUSAL:
+            if IS_CAUSAL:
                 kv_idx = BLOCK_C * t + jnp.arange(BLOCK_C)
                 causal_mask = kv_idx[None, :] > q_idx[:, None]
                 s_blk_masked = jnp.where(causal_mask, -jnp.inf, s_blk)
@@ -410,7 +427,7 @@ def flash_attention_bwd_dq_kernel(
             return dq_acc
 
         # For causal: skip KV blocks this Q can't see (t > q_blk_idx)
-        if CAUSAL:
+        if IS_CAUSAL:
             return jax.lax.cond(t > q_blk_idx, skip_block, compute_block, None)
         else:
             return compute_block(None)
@@ -523,7 +540,7 @@ if __name__ == "__main__":
     parser.add_argument("--block-c", type=int, default=BLOCK_C, help="Block size C (KV cols)")
     parser.add_argument("--num-warps", type=int, default=NUM_WARPS, help="Number of warps")
     parser.add_argument("--num-stages", type=int, default=NUM_STAGES, help="Number of pipeline stages")
-    parser.add_argument("--causal", action="store_true", help="Use causal masking")
+    parser.add_argument("--window-size", type=str, default=None, help="Sliding window as 'left,right' tuple (e.g., '-1,0' for causal, '64,64' for bidirectional)")
     parser.add_argument("--interpret-mode", action="store_true", help="Use Pallas interpreter mode")
     parser.add_argument("--batch-size", type=int, default=2, help="Batch size (B)")
     parser.add_argument("--num-heads", type=int, default=4, help="Number of heads (H)")
@@ -532,7 +549,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     B, H, T, D = args.batch_size, args.num_heads, args.seq_len, args.head_dim
-    print(f"Config: BLOCK_R={args.block_r}, BLOCK_C={args.block_c}, NUM_WARPS={args.num_warps}, NUM_STAGES={args.num_stages}, CAUSAL={args.causal}, INTERPRET_MODE={args.interpret_mode}")
+    print(f"Config: BLOCK_R={args.block_r}, BLOCK_C={args.block_c}, NUM_WARPS={args.num_warps}, NUM_STAGES={args.num_stages}, WINDOW_SIZE={WINDOW_SIZE}, INTERPRET_MODE={args.interpret_mode}")
     print(f"Testing with shapes: B={B}, H={H}, T={T}, D={D}")
 
     key = jax.random.key(0)
@@ -546,7 +563,6 @@ if __name__ == "__main__":
     # Forward check
     o_ref = mha_reference(q, k, v)
     logsumexp_ref = _compute_logsumexp(q, k)
-    o_cudnn_ref = cudnn_attention(q, k, v)
     o_flash, logsumexp_flash = flash_attention_fwd(q, k, v)
 
     # Test nshepperd/flash_attn_jax reference (skip in INTERPRET_MODE)
@@ -556,6 +572,7 @@ if __name__ == "__main__":
             f"flash_attn_jax max diff: {jnp.max(jnp.abs(o_flash_attn_jax - o_ref))}"
         print("flash_attn_jax reference check passed!")
 
+    o_cudnn_ref = cudnn_attention(q, k, v)
     assert jnp.allclose(o_cudnn_ref, o_ref, atol=1e-1, rtol=1e-2),f"o max diff: {jnp.max(jnp.abs(o_cudnn_ref - o_ref))}"
     assert jnp.allclose(o_flash, o_ref, atol=1e-1, rtol=1e-2), f"o max diff: {jnp.max(jnp.abs(o_flash - o_ref))}"
     assert jnp.allclose(logsumexp_flash, logsumexp_ref, atol=1e-2, rtol=1e-2), f"logsumexp max diff: {jnp.max(jnp.abs(logsumexp_flash - logsumexp_ref))}"
