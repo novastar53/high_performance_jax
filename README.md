@@ -37,6 +37,26 @@ scripts/
 └── plot_roofline.py          # Generate roofline plots from JSON data
 ```
 
+## Pallas Flash Attention Benchmarks
+
+Performance comparison of our Pallas flash attention implementation against JAX's built-in `dot_product_attention` and `flash_attn_jax` (C++ CUDA).
+
+**T=8192** (B=2, H=4, D=64, BLOCK_R=128, BLOCK_C=128, NUM_WARPS=8, NUM_STAGES=5, causal=True):
+
+| Pass | JAX dot_product_attention | Our flash_attention | flash_attn_jax (C++ CUDA) |
+|------|---------------------------|---------------------|---------------------------|
+| Forward | 1.461 ms | 1.745 ms | 1.361 ms |
+| Backward | 4.062 ms | 6.092 ms | 3.257 ms |
+| Total | 5.524 ms | 7.838 ms | 4.618 ms |
+
+**T=4096** (B=2, H=4, D=64, BLOCK_R=128, BLOCK_C=128, NUM_WARPS=4, NUM_STAGES=3, causal=True):
+
+| Pass | JAX dot_product_attention | Our flash_attention | flash_attn_jax (C++ CUDA) |
+|------|---------------------------|---------------------|---------------------------|
+| Forward | 0.540 ms | 0.805 ms | 0.559 ms |
+| Backward | 1.451 ms | 3.466 ms | 1.256 ms |
+| Total | 1.990 ms | 4.271 ms | 1.815 ms |
+
 ## Profiling
 
 This repository includes reusable profiling utilities based on XProf for analyzing kernel performance.
