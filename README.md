@@ -80,4 +80,32 @@ Total (Forward + Backward):
   JAX dot_product_attention: 1.990 ms
   Our flash_attention:       4.271 ms
   flash_attn_jax (C++ CUDA):  1.815 ms
+
+
+Config: BLOCK_R=128, BLOCK_C=128, NUM_WARPS=8, NUM_STAGES=4, CAUSAL=True, INTERPRET_MODE=False
+Testing with shapes: B=2, H=4, T=4096, D=64
+flash_attn_jax reference check passed!
+Forward pass check passed!
+Preprocess kernel (D) check passed!
+Backward pass check passed!
+
+============================================================
+Timing Comparison
+============================================================
+Benchmark shape: B=2, H=4, T=4096, D=64
+
+Forward pass:
+  JAX dot_product_attention: 0.575 ms
+  Our flash_attention:       0.584 ms
+  flash_attn_jax (C++ CUDA):  0.576 ms
+
+Backward pass only:
+  JAX dot_product_attention: 1.670 ms
+  Our flash_attention:       2.148 ms
+  flash_attn_jax (C++ CUDA):  1.468 ms
+
+Total (Forward + Backward):
+  JAX dot_product_attention: 2.245 ms
+  Our flash_attention:       2.732 ms
+  flash_attn_jax (C++ CUDA):  2.044 ms
 ```

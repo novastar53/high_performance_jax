@@ -71,7 +71,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num-heads",
         type=int,
-        default=8,
+        default=4,
         help="Number of heads (H)",
     )
     parser.add_argument(
