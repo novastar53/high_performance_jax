@@ -139,16 +139,20 @@ def flash_attn_jax_wrapper(q, k, v):
     """
     from flash_attn_jax import flash_mha
 
-    # Derive is_causal from WINDOW_SIZE: causal if right limit is 0
-    is_causal = WINDOW_SIZE is not None and WINDOW_SIZE[1] == 0
-
     # nshepperd/flash_attn_jax expects (n, l, h, d) format
     # Our format is (B, H, T, D), so transpose axes 1 and 2
     q_t = jnp.transpose(q, (0, 2, 1, 3))
     k_t = jnp.transpose(k, (0, 2, 1, 3))
     v_t = jnp.transpose(v, (0, 2, 1, 3))
 
-    out = flash_mha(q_t, k_t, v_t, is_causal=is_causal)
+    is_causal = (WINDOW_SIZE == (-1,0))
+    is_bidirectional = (WINDOW_SIZE == (-1,-1))
+    if is_causal:
+        out = flash_mha(q_t, k_t, v_t, is_causal=True)
+    elif is_bidirectional:
+        out = flash_mha(q_t, k_t, v_t, is_causal=False)
+    else:
+        out = flash_mha(q_t, k_t, v_t, window_size=WINDOW_SIZE)
     return jnp.transpose(out, (0, 2, 1, 3))
 
 
