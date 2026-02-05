@@ -198,9 +198,9 @@ def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, qk_
 
     num_body = num_body_causal if CAUSAL else num_body_noncausal
     max_reg, l_reg, o_reg = jax.lax.fori_loop(0, num_k_blocks, num_body, (max_reg, l_reg, o_reg))
-    # Convert from log2 domain back to natural log for logsumexp output
-    # logsumexp = max/log2(e) + log(l) = max/log2(e) + log2(l)/log2(e)
-    logsumexp_reg = (max_reg + jnp.log2(l_reg)) / LOG2E
+    # Store logsumexp in log2 domain to avoid conversion overhead in backward
+    # logsumexp_log2 = max + log2(l) where max is already in log2 domain
+    logsumexp_reg = max_reg + jnp.log2(l_reg)
     o_reg = o_reg / l_reg[:, None]
     plgpu.store(o_ref.at[0, :, :], o_reg.astype(o_ref.dtype))
     plgpu.store(logsumexp_ref.at[0, :], logsumexp_reg.astype(logsumexp_ref.dtype))
@@ -323,10 +323,9 @@ def flash_attention_bwd_dkv_kernel(
         do_blk = plgpu.load(do_ref.at[0, idx, :])
         logsumexp_blk = plgpu.load(logsumexp_ref.at[0, idx])
         d_blk = plgpu.load(d_ref.at[0, idx])
-        # s_blk in log2 domain, logsumexp in natural log domain
+        # Both s_blk and logsumexp are in log2 domain
         s_blk = pl.dot(q_blk, k_reg, trans_b=True, precision='float32') * qk_scale
-        # Convert logsumexp to log2 domain for exp2
-        p_blk = jnp.exp2(s_blk - logsumexp_blk[..., None] * LOG2E)
+        p_blk = jnp.exp2(s_blk - logsumexp_blk[..., None])
         dp_blk = pl.dot(do_blk, v_reg, trans_b=True)
         ds_blk = p_blk * (dp_blk - d_blk[..., None]) * softmax_scale
         dv_acc += pl.dot(p_blk.astype(do_blk.dtype), do_blk, trans_a=True)
@@ -346,7 +345,7 @@ def flash_attention_bwd_dkv_kernel(
             s_blk = pl.dot(q_blk, k_reg, trans_b=True, precision='float32') * qk_scale
             mask = kv_idx[None, :] > q_idx[:, None]
             s_blk = jnp.where(mask, -jnp.inf, s_blk)
-            p_blk = jnp.exp2(s_blk - logsumexp_blk[..., None] * LOG2E)
+            p_blk = jnp.exp2(s_blk - logsumexp_blk[..., None])
             dp_blk = pl.dot(do_blk, v_reg, trans_b=True)
             ds_blk = p_blk * (dp_blk - d_blk[..., None]) * softmax_scale
             dv_new = dv_acc + pl.dot(p_blk.astype(do_blk.dtype), do_blk, trans_a=True)
@@ -427,10 +426,9 @@ def flash_attention_bwd_dq_kernel(
         idx = pl.dslice(t * BLOCK_C, BLOCK_C)
         k_blk = plgpu.load(k_ref.at[0, idx, :])
         v_blk = plgpu.load(v_ref.at[0, idx, :])
-        # s_blk in log2 domain
+        # Both s_blk and logsumexp are in log2 domain
         s_blk = pl.dot(q_reg, k_blk, trans_b=True, precision='float32') * qk_scale
-        # Convert logsumexp to log2 domain for exp2
-        p_blk = jnp.exp2(s_blk - logsumexp_reg[..., None] * LOG2E)
+        p_blk = jnp.exp2(s_blk - logsumexp_reg[..., None])
         dp_blk = pl.dot(do_reg, v_blk, trans_b=True)
         ds_blk = p_blk * (dp_blk - d_reg[..., None]) * softmax_scale
         dq_acc += pl.dot(ds_blk.astype(k_blk.dtype), k_blk)
@@ -447,7 +445,7 @@ def flash_attention_bwd_dq_kernel(
             s_blk = pl.dot(q_reg, k_blk, trans_b=True, precision='float32') * qk_scale
             mask = kv_idx[None, :] > q_idx[:, None]
             s_blk = jnp.where(mask, -jnp.inf, s_blk)
-            p_blk = jnp.exp2(s_blk - logsumexp_reg[..., None] * LOG2E)
+            p_blk = jnp.exp2(s_blk - logsumexp_reg[..., None])
             dp_blk = pl.dot(do_reg, v_blk, trans_b=True)
             ds_blk = p_blk * (dp_blk - d_reg[..., None]) * softmax_scale
             dq_new = dq_acc + pl.dot(ds_blk.astype(k_blk.dtype), k_blk)
@@ -604,7 +602,9 @@ if __name__ == "__main__":
 
     assert jnp.allclose(o_cudnn_ref, o_ref, atol=1e-1, rtol=1e-2),f"o max diff: {jnp.max(jnp.abs(o_cudnn_ref - o_ref))}"
     assert jnp.allclose(o_flash, o_ref, atol=1e-1, rtol=1e-2), f"o max diff: {jnp.max(jnp.abs(o_flash - o_ref))}"
-    assert jnp.allclose(logsumexp_flash, logsumexp_ref, atol=1e-2, rtol=1e-2), f"logsumexp max diff: {jnp.max(jnp.abs(logsumexp_flash - logsumexp_ref))}"
+    # logsumexp_flash is in log2 domain, convert logsumexp_ref to log2 for comparison
+    logsumexp_ref_log2 = logsumexp_ref * LOG2E
+    assert jnp.allclose(logsumexp_flash, logsumexp_ref_log2, atol=1e-2, rtol=1e-2), f"logsumexp max diff: {jnp.max(jnp.abs(logsumexp_flash - logsumexp_ref_log2))}"
     print("Forward pass check passed!")
 
     # Backward check (reference)
