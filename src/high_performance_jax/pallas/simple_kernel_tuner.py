@@ -77,7 +77,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--seq-len",
         type=int,
-        default=2048,
+        default=4096,
         help="Sequence length (T)",
     )
     parser.add_argument(
