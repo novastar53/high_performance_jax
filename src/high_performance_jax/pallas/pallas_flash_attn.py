@@ -61,6 +61,7 @@ NUM_STAGES = _args.num_stages
 DTYPE = jnp.bfloat16
 JAX_SDPA_IMPL = "cudnn"
 CAUSAL = _args.causal
+LOG2E = math.log2(math.e)  # ~1.4427, for exp2 optimization
 
 if INTERPRET_MODE:
     JAX_SDPA_IMPL = "xla"
@@ -137,13 +138,17 @@ def flash_attn_jax_wrapper(q, k, v):
 
 # Flash Attention Forward
 
-def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, scale, num_k_blocks):
-    """Flash attention forward kernel."""
+def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, qk_scale, num_k_blocks):
+    """Flash attention forward kernel.
+
+    Uses exp2 with log2(e) scaling for faster GPU execution.
+    All internal max values are kept in log2 domain.
+    """
     q_reg = plgpu.load(q_ref.at[0, :, :])
     o_reg = jnp.zeros(q_reg.shape, jnp.float32)
+    # max_reg is in log2 domain (scaled by log2(e))
     max_reg = jnp.full((BLOCK_R,), -jnp.inf, dtype=jnp.float32)
     l_reg = jnp.zeros((BLOCK_R,), dtype=jnp.float32)
-    logsumexp_reg = jnp.zeros((BLOCK_R,), dtype=jnp.float32)
 
     blk_idx = pl.program_id(1)
     q_idx = BLOCK_R * blk_idx + jnp.arange(BLOCK_R)
@@ -153,14 +158,18 @@ def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, sca
         idx = pl.dslice(t * BLOCK_C, BLOCK_C)
         k_blk = plgpu.load(k_ref.at[0, idx, :])
         v_blk = plgpu.load(v_ref.at[0, idx, :])
-        s_blk = pl.dot(q_reg, k_blk, trans_b=True, precision='float32') / scale
+        # qk_scale = log2(e) / sqrt(d), so s_blk is in log2 domain
+        s_blk = pl.dot(q_reg, k_blk, trans_b=True, precision='float32') * qk_scale
         max_blk = jnp.maximum(max_reg, jnp.max(s_blk, axis=-1))
-        s_blk = jnp.exp(s_blk - max_blk[:, None])
-        l_blk = jnp.sum(s_blk, axis=-1)
-        o_blk = pl.dot(s_blk.astype(v_blk.dtype), v_blk)
+        # exp2 is faster than exp on GPU
+        p_blk = jnp.exp2(s_blk - max_blk[:, None])
+        l_blk = jnp.sum(p_blk, axis=-1)
+        o_blk = pl.dot(p_blk.astype(v_blk.dtype), v_blk)
+        # Correction factor also uses exp2 since max is in log2 domain
+        alpha = jnp.exp2(max_reg - max_blk)
         return (max_blk,
-                l_reg * jnp.exp(max_reg - max_blk) + l_blk,
-                o_reg * jnp.exp(max_reg - max_blk)[:, None] + o_blk)
+                l_reg * alpha + l_blk,
+                o_reg * alpha[:, None] + o_blk)
 
     def num_body_causal(t, args):
         max_reg, l_reg, o_reg = args
@@ -170,16 +179,17 @@ def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, sca
         v_blk = plgpu.load(v_ref.at[0, idx, :])
 
         def compute_block(_):
-            s_blk = pl.dot(q_reg, k_blk, trans_b=True, precision='float32') / scale
+            s_blk = pl.dot(q_reg, k_blk, trans_b=True, precision='float32') * qk_scale
             mask = kv_idx[None, :] > q_idx[:, None]
             s_blk = jnp.where(mask, -jnp.inf, s_blk)
             max_blk = jnp.maximum(max_reg, jnp.max(s_blk, axis=-1))
-            s_blk = jnp.exp(s_blk - max_blk[:, None])
-            l_blk = jnp.sum(s_blk, axis=-1)
-            o_blk = pl.dot(s_blk.astype(v_blk.dtype), v_blk)
+            p_blk = jnp.exp2(s_blk - max_blk[:, None])
+            l_blk = jnp.sum(p_blk, axis=-1)
+            o_blk = pl.dot(p_blk.astype(v_blk.dtype), v_blk)
+            alpha = jnp.exp2(max_reg - max_blk)
             return (max_blk,
-                    l_reg * jnp.exp(max_reg - max_blk) + l_blk,
-                    o_reg * jnp.exp(max_reg - max_blk)[:, None] + o_blk)
+                    l_reg * alpha + l_blk,
+                    o_reg * alpha[:, None] + o_blk)
 
         def skip_block(_):
             return (max_reg, l_reg, o_reg)
@@ -188,7 +198,9 @@ def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, sca
 
     num_body = num_body_causal if CAUSAL else num_body_noncausal
     max_reg, l_reg, o_reg = jax.lax.fori_loop(0, num_k_blocks, num_body, (max_reg, l_reg, o_reg))
-    logsumexp_reg = max_reg + jnp.log(l_reg)
+    # Convert from log2 domain back to natural log for logsumexp output
+    # logsumexp = max/log2(e) + log(l) = max/log2(e) + log2(l)/log2(e)
+    logsumexp_reg = (max_reg + jnp.log2(l_reg)) / LOG2E
     o_reg = o_reg / l_reg[:, None]
     plgpu.store(o_ref.at[0, :, :], o_reg.astype(o_ref.dtype))
     plgpu.store(logsumexp_ref.at[0, :], logsumexp_reg.astype(logsumexp_ref.dtype))
@@ -203,12 +215,13 @@ def flash_attention_fwd(q, k, v):
     q_flat = q.reshape(-1, T, C)
     k_flat = k.reshape(-1, T, C)
     v_flat = v.reshape(-1, T, C)
-    scale = math.sqrt(C)
+    # qk_scale combines softmax scaling with log2(e) for exp2 optimization
+    qk_scale = LOG2E / math.sqrt(C)
     num_k_blocks = pl.cdiv(T, BLOCK_C)
     grid = (B_flat, pl.cdiv(T, BLOCK_R))
 
     out_flat, logsumexp = pl.pallas_call(
-        partial(flash_attention_fwd_kernel, scale=scale, num_k_blocks=num_k_blocks),
+        partial(flash_attention_fwd_kernel, qk_scale=qk_scale, num_k_blocks=num_k_blocks),
         out_shape=[
             jax.ShapeDtypeStruct(q_flat.shape, q_flat.dtype),
             jax.ShapeDtypeStruct((B*H, T), q_flat.dtype)
@@ -281,7 +294,7 @@ def flash_attention_bwd_preprocess(o_flat, do_flat):
 def flash_attention_bwd_dkv_kernel(
     q_ref, k_ref, v_ref, do_ref, logsumexp_ref, d_ref,
     dk_ref, dv_ref,
-    *, scale, num_q_blocks,
+    *, qk_scale, softmax_scale, num_q_blocks,
 ):
     """Compute dK and dV gradients.
 
@@ -292,6 +305,8 @@ def flash_attention_bwd_dkv_kernel(
     For each KV block, we accumulate:
         dV += P^T @ dO
         dK += dS^T @ Q  (where dS = P ⊙ (dP - D))
+
+    Uses exp2 with log2(e) scaling for faster GPU execution.
     """
     k_reg = plgpu.load(k_ref.at[0, :, :])
     v_reg = plgpu.load(v_ref.at[0, :, :])
@@ -308,10 +323,12 @@ def flash_attention_bwd_dkv_kernel(
         do_blk = plgpu.load(do_ref.at[0, idx, :])
         logsumexp_blk = plgpu.load(logsumexp_ref.at[0, idx])
         d_blk = plgpu.load(d_ref.at[0, idx])
-        s_blk = pl.dot(q_blk, k_reg, trans_b=True, precision='float32') / scale
-        p_blk = jnp.exp(s_blk - logsumexp_blk[..., None])
+        # s_blk in log2 domain, logsumexp in natural log domain
+        s_blk = pl.dot(q_blk, k_reg, trans_b=True, precision='float32') * qk_scale
+        # Convert logsumexp to log2 domain for exp2
+        p_blk = jnp.exp2(s_blk - logsumexp_blk[..., None] * LOG2E)
         dp_blk = pl.dot(do_blk, v_reg, trans_b=True)
-        ds_blk = p_blk * (dp_blk - d_blk[..., None]) / scale
+        ds_blk = p_blk * (dp_blk - d_blk[..., None]) * softmax_scale
         dv_acc += pl.dot(p_blk.astype(do_blk.dtype), do_blk, trans_a=True)
         dk_acc += pl.dot(ds_blk.astype(q_blk.dtype), q_blk, trans_a=True)
         return (dk_acc, dv_acc)
@@ -326,12 +343,12 @@ def flash_attention_bwd_dkv_kernel(
         q_idx = BLOCK_R * t + jnp.arange(BLOCK_R)
 
         def compute_block(_):
-            s_blk = pl.dot(q_blk, k_reg, trans_b=True, precision='float32') / scale
+            s_blk = pl.dot(q_blk, k_reg, trans_b=True, precision='float32') * qk_scale
             mask = kv_idx[None, :] > q_idx[:, None]
             s_blk = jnp.where(mask, -jnp.inf, s_blk)
-            p_blk = jnp.exp(s_blk - logsumexp_blk[..., None])
+            p_blk = jnp.exp2(s_blk - logsumexp_blk[..., None] * LOG2E)
             dp_blk = pl.dot(do_blk, v_reg, trans_b=True)
-            ds_blk = p_blk * (dp_blk - d_blk[..., None]) / scale
+            ds_blk = p_blk * (dp_blk - d_blk[..., None]) * softmax_scale
             dv_new = dv_acc + pl.dot(p_blk.astype(do_blk.dtype), do_blk, trans_a=True)
             dk_new = dk_acc + pl.dot(ds_blk.astype(q_blk.dtype), q_blk, trans_a=True)
             return (dk_new, dv_new)
@@ -347,14 +364,14 @@ def flash_attention_bwd_dkv_kernel(
     plgpu.store(dv_ref, dv_acc.astype(dv_ref.dtype))
 
 
-def flash_attention_bwd_dkv(q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_flat, scale):
+def flash_attention_bwd_dkv(q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_flat, qk_scale, softmax_scale):
     """Compute dK and dV using pallas_call."""
     B_flat, T, C = q_flat.shape
     num_q_blocks = pl.cdiv(T, BLOCK_R)
     grid = (B_flat, pl.cdiv(T, BLOCK_C))  # Outer loop over KV blocks
 
     dk_flat, dv_flat = pl.pallas_call(
-        partial(flash_attention_bwd_dkv_kernel, scale=scale, num_q_blocks=num_q_blocks),
+        partial(flash_attention_bwd_dkv_kernel, qk_scale=qk_scale, softmax_scale=softmax_scale, num_q_blocks=num_q_blocks),
         out_shape=[
             jax.ShapeDtypeStruct(k_flat.shape, k_flat.dtype),  # dK
             jax.ShapeDtypeStruct(v_flat.shape, v_flat.dtype),  # dV
@@ -384,7 +401,7 @@ def flash_attention_bwd_dkv(q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_f
 def flash_attention_bwd_dq_kernel(
     q_ref, k_ref, v_ref, do_ref, logsumexp_ref, d_ref,
     dq_ref,
-    *, scale, num_kv_blocks
+    *, qk_scale, softmax_scale, num_kv_blocks
 ):
     """Compute dQ gradient.
 
@@ -394,6 +411,8 @@ def flash_attention_bwd_dq_kernel(
 
     For each Q block, we accumulate:
         dQ += dS @ K  (where dS = P ⊙ (dP - D))
+
+    Uses exp2 with log2(e) scaling for faster GPU execution.
     """
     q_reg = plgpu.load(q_ref.at[0, :, :])
     do_reg = plgpu.load(do_ref.at[0, :, :])
@@ -408,10 +427,12 @@ def flash_attention_bwd_dq_kernel(
         idx = pl.dslice(t * BLOCK_C, BLOCK_C)
         k_blk = plgpu.load(k_ref.at[0, idx, :])
         v_blk = plgpu.load(v_ref.at[0, idx, :])
-        s_blk = pl.dot(q_reg, k_blk, trans_b=True, precision='float32') / scale
-        p_blk = jnp.exp(s_blk - logsumexp_reg[..., None])
+        # s_blk in log2 domain
+        s_blk = pl.dot(q_reg, k_blk, trans_b=True, precision='float32') * qk_scale
+        # Convert logsumexp to log2 domain for exp2
+        p_blk = jnp.exp2(s_blk - logsumexp_reg[..., None] * LOG2E)
         dp_blk = pl.dot(do_reg, v_blk, trans_b=True)
-        ds_blk = p_blk * (dp_blk - d_reg[..., None]) / scale
+        ds_blk = p_blk * (dp_blk - d_reg[..., None]) * softmax_scale
         dq_acc += pl.dot(ds_blk.astype(k_blk.dtype), k_blk)
         return dq_acc
 
@@ -423,12 +444,12 @@ def flash_attention_bwd_dq_kernel(
         kv_idx = BLOCK_C * t + jnp.arange(BLOCK_C)
 
         def compute_block(_):
-            s_blk = pl.dot(q_reg, k_blk, trans_b=True, precision='float32') / scale
+            s_blk = pl.dot(q_reg, k_blk, trans_b=True, precision='float32') * qk_scale
             mask = kv_idx[None, :] > q_idx[:, None]
             s_blk = jnp.where(mask, -jnp.inf, s_blk)
-            p_blk = jnp.exp(s_blk - logsumexp_reg[..., None])
+            p_blk = jnp.exp2(s_blk - logsumexp_reg[..., None] * LOG2E)
             dp_blk = pl.dot(do_reg, v_blk, trans_b=True)
-            ds_blk = p_blk * (dp_blk - d_reg[..., None]) / scale
+            ds_blk = p_blk * (dp_blk - d_reg[..., None]) * softmax_scale
             dq_new = dq_acc + pl.dot(ds_blk.astype(k_blk.dtype), k_blk)
             return dq_new
 
@@ -442,14 +463,14 @@ def flash_attention_bwd_dq_kernel(
     plgpu.store(dq_ref, dq_acc.astype(dq_ref.dtype))
 
 
-def flash_attention_bwd_dq(q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_flat, scale):
+def flash_attention_bwd_dq(q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_flat, qk_scale, softmax_scale):
     """Compute dQ using pallas_call."""
     B_flat, T, C = q_flat.shape
     num_kv_blocks = pl.cdiv(T, BLOCK_C)
     grid = (B_flat, pl.cdiv(T, BLOCK_R))  # Outer loop over Q blocks
 
     dq_flat = pl.pallas_call(
-        partial(flash_attention_bwd_dq_kernel, scale=scale, num_kv_blocks=num_kv_blocks),
+        partial(flash_attention_bwd_dq_kernel, qk_scale=qk_scale, softmax_scale=softmax_scale, num_kv_blocks=num_kv_blocks),
         out_shape=jax.ShapeDtypeStruct(q_flat.shape, q_flat.dtype),
         grid=grid,
         in_specs=[
@@ -474,7 +495,10 @@ def flash_attention_bwd_dq(q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_fl
 def flash_attention_bwd(q, k, v, o, logsumexp, do):
     """Flash attention backward pass using 3 separate kernels."""
     B, H, T, C = q.shape
-    scale = math.sqrt(C)
+    # qk_scale for exp2 optimization (log2(e) / sqrt(d))
+    qk_scale = LOG2E / math.sqrt(C)
+    # softmax_scale for gradient computation (1 / sqrt(d))
+    softmax_scale = 1.0 / math.sqrt(C)
 
     # Flatten batch and head dimensions
     q_flat = q.reshape(-1, T, C)
@@ -489,12 +513,12 @@ def flash_attention_bwd(q, k, v, o, logsumexp, do):
 
     # Kernel 2: Compute dK, dV (outer loop over KV blocks)
     dk_flat, dv_flat = flash_attention_bwd_dkv(
-        q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_flat, scale
+        q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_flat, qk_scale, softmax_scale
     )
 
     # Kernel 3: Compute dQ (outer loop over Q blocks)
     dq_flat = flash_attention_bwd_dq(
-        q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_flat, scale
+        q_flat, k_flat, v_flat, do_flat, logsumexp_flat, d_flat, qk_scale, softmax_scale
     )
 
     return (
