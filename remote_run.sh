@@ -1,12 +1,13 @@
 #!/bin/bash
 # remote_run.sh - Run Python scripts on remote machines with log streaming
 #
-# Usage: ./remote_run.sh [-d] [-n SESSION] <ssh-host> <script-path> [script-args...]
+# Usage: ./remote_run.sh [-d] [-n SESSION] [-b BRANCH] <ssh-host> <script-path> [script-args...]
 #        ./remote_run.sh <ssh-host> <command>
 #
 # Options:
 #   -d           - Detached mode (run in background)
 #   -n SESSION   - Custom tmux session name (default: jax_remote)
+#   -b BRANCH    - Git branch or commit to checkout before running
 #
 # Commands (when no script path provided):
 #   attach       - Attach to running tmux session
@@ -18,6 +19,8 @@
 #   ./remote_run.sh runpod1 src/high_performance_jax/pallas/pallas_softmax.py
 #   ./remote_run.sh -d runpod1 scripts/roofline_attention.py run
 #   ./remote_run.sh -d -n my_experiment runpod1 src/high_performance_jax/moe.py
+#   ./remote_run.sh -b feature-branch runpod1 src/high_performance_jax/moe.py
+#   ./remote_run.sh -b abc123 runpod1 src/high_performance_jax/moe.py
 #   ./remote_run.sh runpod1 attach
 #   ./remote_run.sh runpod1 status
 #   ./remote_run.sh runpod1 stop
@@ -42,14 +45,18 @@ NC='\033[0m' # No Color
 # Parse options
 DETACH=false
 SESSION_NAME="$DEFAULT_SESSION"
+GIT_REF=""
 
-while getopts "dn:" opt; do
+while getopts "dn:b:" opt; do
     case $opt in
         d)
             DETACH=true
             ;;
         n)
             SESSION_NAME="$OPTARG"
+            ;;
+        b)
+            GIT_REF="$OPTARG"
             ;;
         \?)
             echo -e "${RED}Invalid option: -$OPTARG${NC}" >&2
@@ -65,8 +72,13 @@ SECOND_ARG=${2:-}
 
 if [ -z "$SSH_HOST" ]; then
     echo -e "${RED}Error: SSH host is required${NC}"
-    echo "Usage: $0 [-d] [-n SESSION] <ssh-host> <script-path> [script-args...]"
+    echo "Usage: $0 [-d] [-n SESSION] [-b BRANCH] <ssh-host> <script-path> [script-args...]"
     echo "   or: $0 <ssh-host> <command>"
+    echo ""
+    echo "Options:"
+    echo "  -d           Detached mode (run in background)"
+    echo "  -n SESSION   Custom tmux session name (default: jax_remote)"
+    echo "  -b BRANCH    Git branch or commit to checkout before running"
     echo ""
     echo "Commands: attach, stream, status, stop"
     exit 1
@@ -120,58 +132,83 @@ validate_script() {
 # Helper function to setup remote environment
 setup_remote() {
     echo -e "${GREEN}Setting up remote environment...${NC}"
-    
-    remote_exec "bash -l" << 'REMOTE_SCRIPT'
+    if [ -n "$GIT_REF" ]; then
+        echo -e "${BLUE}Will checkout: $GIT_REF${NC}"
+    fi
+
+    remote_exec "bash -l" << REMOTE_SCRIPT
 set -e
 
 # Expand REMOTE_DIR
-REMOTE_DIR_EXPANDED=$(eval echo ~/high_performance_jax)
-PARENT_DIR=$(dirname "$REMOTE_DIR_EXPANDED")
+REMOTE_DIR_EXPANDED=\$(eval echo ~/high_performance_jax)
+PARENT_DIR=\$(dirname "\$REMOTE_DIR_EXPANDED")
 
 # Clone or update main repo
-if [ -d "$REMOTE_DIR_EXPANDED" ]; then
+if [ -d "\$REMOTE_DIR_EXPANDED" ]; then
     echo "Updating existing repo..."
-    cd "$REMOTE_DIR_EXPANDED"
+    cd "\$REMOTE_DIR_EXPANDED"
     git fetch origin
+    git checkout main
     git pull origin main
 else
     echo "Cloning repo..."
-    mkdir -p "$PARENT_DIR"
-    git clone https://github.com/novastar53/high_performance_jax.git "$REMOTE_DIR_EXPANDED"
-    cd "$REMOTE_DIR_EXPANDED"
+    mkdir -p "\$PARENT_DIR"
+    git clone https://github.com/novastar53/high_performance_jax.git "\$REMOTE_DIR_EXPANDED"
+    cd "\$REMOTE_DIR_EXPANDED"
+fi
+
+# Checkout specified branch/commit if provided
+GIT_REF="$GIT_REF"
+if [ -n "\$GIT_REF" ]; then
+    echo "Checking out: \$GIT_REF"
+    git checkout "\$GIT_REF"
 fi
 
 # Clone or update deepkit dependency (required sibling directory)
-DEEPKIT_DIR="$PARENT_DIR/deepkit"
-if [ -d "$DEEPKIT_DIR" ]; then
+DEEPKIT_DIR="\$PARENT_DIR/deepkit"
+if [ -d "\$DEEPKIT_DIR" ]; then
     echo "Updating deepkit dependency..."
-    cd "$DEEPKIT_DIR"
+    cd "\$DEEPKIT_DIR"
     git fetch origin
     git pull origin main
 else
     echo "Cloning deepkit dependency..."
-    mkdir -p "$PARENT_DIR"
-    git clone https://github.com/novastar53/deepkit "$DEEPKIT_DIR"
+    mkdir -p "\$PARENT_DIR"
+    git clone https://github.com/novastar53/deepkit "\$DEEPKIT_DIR"
 fi
 
 # Create log directory
 mkdir -p ~/.cache/jax_remote
 
 # Source uv environment
-if [ -f "$HOME/.local/bin/env" ]; then
-    source "$HOME/.local/bin/env"
+if [ -f "\$HOME/.local/bin/env" ]; then
+    source "\$HOME/.local/bin/env"
+fi
+
+# Install tmux if needed
+if ! command -v tmux &> /dev/null; then
+    echo "Installing tmux..."
+    if command -v apt-get &> /dev/null; then
+        sudo apt-get update && sudo apt-get install -y tmux
+    elif command -v yum &> /dev/null; then
+        sudo yum install -y tmux
+    elif command -v apk &> /dev/null; then
+        apk add tmux
+    else
+        echo "Warning: Could not install tmux - unknown package manager"
+    fi
 fi
 
 # Install dependencies if needed
 if ! command -v uv &> /dev/null; then
     echo "Installing uv..."
     curl -LsSf https://astral.sh/uv/install.sh | sh
-    source "$HOME/.local/bin/env"
+    source "\$HOME/.local/bin/env"
 fi
 
 # Install project dependencies
 echo "Ensuring dependencies are installed..."
-cd "$REMOTE_DIR_EXPANDED"
+cd "\$REMOTE_DIR_EXPANDED"
 uv sync --extra gpu 2>/dev/null || uv sync --extra tpu 2>/dev/null || uv sync
 
 echo "Remote setup complete!"
