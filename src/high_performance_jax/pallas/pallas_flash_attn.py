@@ -28,6 +28,8 @@ The kernel structure would be similar to your softmax kernel, but:
 This keeps memory usage at O(N) instead of O(N²) since you never store the full attention matrix.
 """
 from functools import partial
+import argparse
+import sys
 
 import math
 
@@ -38,15 +40,27 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
 
-INTERPRET_MODE = False  # Set to False on GPU
+def _parse_global_args():
+    parser = argparse.ArgumentParser(description="Flash attention kernel config", add_help=False)
+    parser.add_argument("--block-r", type=int, default=64, help="Block size R (Q rows)")
+    parser.add_argument("--block-c", type=int, default=64, help="Block size C (KV cols)")
+    parser.add_argument("--num-warps", type=int, default=4, help="Number of warps")
+    parser.add_argument("--num-stages", type=int, default=3, help="Number of pipeline stages")
+    parser.add_argument("--causal", action="store_true", help="Use causal masking")
+    parser.add_argument("--interpret-mode", action="store_true", help="Use Pallas interpreter mode")
+    args, _ = parser.parse_known_args()
+    return args
 
-BLOCK_R = 64
-BLOCK_C = 64
-NUM_WARPS = 4
-NUM_STAGES = 3
+_args = _parse_global_args()
+
+INTERPRET_MODE = _args.interpret_mode
+BLOCK_R = _args.block_r
+BLOCK_C = _args.block_c
+NUM_WARPS = _args.num_warps
+NUM_STAGES = _args.num_stages
 DTYPE = jnp.bfloat16
 JAX_SDPA_IMPL = "cudnn"
-CAUSAL = False
+CAUSAL = _args.causal
 
 if INTERPRET_MODE:
     JAX_SDPA_IMPL = "xla"
@@ -523,9 +537,26 @@ flash_attention.defvjp(flash_attention_fwd_rule, flash_attention_bwd_rule)
 
 
 if __name__ == "__main__":
+    import argparse
     import time
 
-    B, H, T, D = 2, 2, 256, 64
+    parser = argparse.ArgumentParser(description="Flash attention kernel tests")
+    parser.add_argument("--block-r", type=int, default=BLOCK_R, help="Block size R (Q rows)")
+    parser.add_argument("--block-c", type=int, default=BLOCK_C, help="Block size C (KV cols)")
+    parser.add_argument("--num-warps", type=int, default=NUM_WARPS, help="Number of warps")
+    parser.add_argument("--num-stages", type=int, default=NUM_STAGES, help="Number of pipeline stages")
+    parser.add_argument("--causal", action="store_true", help="Use causal masking")
+    parser.add_argument("--interpret-mode", action="store_true", help="Use Pallas interpreter mode")
+    parser.add_argument("--batch-size", type=int, default=2, help="Batch size (B)")
+    parser.add_argument("--num-heads", type=int, default=4, help="Number of heads (H)")
+    parser.add_argument("--seq-len", type=int, default=2048, help="Sequence length (T)")
+    parser.add_argument("--head-dim", type=int, default=64, help="Head dimension (D)")
+    args = parser.parse_args()
+
+    B, H, T, D = args.batch_size, args.num_heads, args.seq_len, args.head_dim
+    print(f"Config: BLOCK_R={args.block_r}, BLOCK_C={args.block_c}, NUM_WARPS={args.num_warps}, NUM_STAGES={args.num_stages}, CAUSAL={args.causal}, INTERPRET_MODE={args.interpret_mode}")
+    print(f"Testing with shapes: B={B}, H={H}, T={T}, D={D}")
+
     key = jax.random.key(0)
     keys = jax.random.split(key, 4)
 
@@ -582,15 +613,12 @@ if __name__ == "__main__":
         print("Timing Comparison")
         print("="*60)
 
-        # Use larger sizes for meaningful timing
-        # Use bfloat16 for cuDNN compatibility
-        B_bench, H_bench, T_bench, D_bench = 4, 8, 8192, 64
-        q_bench = jax.random.normal(keys[0], (B_bench, H_bench, T_bench, D_bench), dtype=DTYPE)
-        k_bench = jax.random.normal(keys[1], (B_bench, H_bench, T_bench, D_bench), dtype=DTYPE)
-        v_bench = jax.random.normal(keys[2], (B_bench, H_bench, T_bench, D_bench), dtype=DTYPE)
-        do_bench = jax.random.normal(keys[3], (B_bench, H_bench, T_bench, D_bench), dtype=DTYPE)
+        q_bench = jax.random.normal(keys[0], (B, H, T, D), dtype=DTYPE)
+        k_bench = jax.random.normal(keys[1], (B, H, T, D), dtype=DTYPE)
+        v_bench = jax.random.normal(keys[2], (B, H, T, D), dtype=DTYPE)
+        do_bench = jax.random.normal(keys[3], (B, H, T, D), dtype=DTYPE)
 
-        print(f"Benchmark shape: B={B_bench}, H={H_bench}, T={T_bench}, D={D_bench}")
+        print(f"Benchmark shape: B={B}, H={H}, T={T}, D={D}")
 
         def _bench(fn, warmup=3, iters=20):
             """Benchmark a function."""
