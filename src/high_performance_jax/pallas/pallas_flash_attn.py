@@ -143,7 +143,6 @@ def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, qk_
 
     Uses exp2 with log2(e) scaling for faster GPU execution.
     All internal max values are kept in log2 domain.
-    For causal attention, uses tighter loop bounds to avoid unnecessary iterations.
     """
     q_reg = plgpu.load(q_ref.at[0, :, :])
     o_reg = jnp.zeros(q_reg.shape, jnp.float32)
@@ -154,39 +153,43 @@ def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, qk_
     blk_idx = pl.program_id(1)
     q_idx = BLOCK_R * blk_idx + jnp.arange(BLOCK_R)
 
-    # For causal: only iterate over KV blocks that could have non-masked elements
-    # Q block i can only attend to KV positions 0..(i+1)*BLOCK_R-1
-    # So we need KV blocks 0..ceil((i+1)*BLOCK_R / BLOCK_C)
-    if CAUSAL:
-        num_k_blocks_actual = pl.cdiv((blk_idx + 1) * BLOCK_R, BLOCK_C)
-        num_k_blocks_actual = jnp.minimum(num_k_blocks_actual, num_k_blocks)
-    else:
-        num_k_blocks_actual = num_k_blocks
-
     def body(t, args):
         max_reg, l_reg, o_reg = args
         idx = pl.dslice(t * BLOCK_C, BLOCK_C)
         k_blk = plgpu.load(k_ref.at[0, idx, :])
         v_blk = plgpu.load(v_ref.at[0, idx, :])
-        # qk_scale = log2(e) / sqrt(d), so s_blk is in log2 domain
-        s_blk = pl.dot(q_reg, k_blk, trans_b=True, precision='float32') * qk_scale
-        # Apply causal mask for partial blocks (where some positions are masked)
-        if CAUSAL:
-            kv_idx = BLOCK_C * t + jnp.arange(BLOCK_C)
-            mask = kv_idx[None, :] > q_idx[:, None]
-            s_blk = jnp.where(mask, -jnp.inf, s_blk)
-        max_blk = jnp.maximum(max_reg, jnp.max(s_blk, axis=-1))
-        # exp2 is faster than exp on GPU
-        p_blk = jnp.exp2(s_blk - max_blk[:, None])
-        l_blk = jnp.sum(p_blk, axis=-1)
-        o_blk = pl.dot(p_blk.astype(v_blk.dtype), v_blk)
-        # Correction factor also uses exp2 since max is in log2 domain
-        alpha = jnp.exp2(max_reg - max_blk)
-        return (max_blk,
-                l_reg * alpha + l_blk,
-                o_reg * alpha[:, None] + o_blk)
 
-    max_reg, l_reg, o_reg = jax.lax.fori_loop(0, num_k_blocks_actual, body, (max_reg, l_reg, o_reg))
+        def compute_block(_):
+            # qk_scale = log2(e) / sqrt(d), so s_blk is in log2 domain
+            s_blk = pl.dot(q_reg, k_blk, trans_b=True, precision='float32') * qk_scale
+            # Apply causal mask for partial blocks
+            if CAUSAL:
+                kv_idx = BLOCK_C * t + jnp.arange(BLOCK_C)
+                causal_mask = kv_idx[None, :] > q_idx[:, None]
+                s_blk_masked = jnp.where(causal_mask, -jnp.inf, s_blk)
+            else:
+                s_blk_masked = s_blk
+            max_blk = jnp.maximum(max_reg, jnp.max(s_blk_masked, axis=-1))
+            # exp2 is faster than exp on GPU
+            p_blk = jnp.exp2(s_blk_masked - max_blk[:, None])
+            l_blk = jnp.sum(p_blk, axis=-1)
+            o_blk = pl.dot(p_blk.astype(v_blk.dtype), v_blk)
+            # Correction factor also uses exp2 since max is in log2 domain
+            alpha = jnp.exp2(max_reg - max_blk)
+            return (max_blk,
+                    l_reg * alpha + l_blk,
+                    o_reg * alpha[:, None] + o_blk)
+
+        def skip_block(_):
+            return (max_reg, l_reg, o_reg)
+
+        # For causal: skip KV blocks that are entirely masked (t > blk_idx)
+        if CAUSAL:
+            return jax.lax.cond(t > blk_idx, skip_block, compute_block, None)
+        else:
+            return compute_block(None)
+
+    max_reg, l_reg, o_reg = jax.lax.fori_loop(0, num_k_blocks, body, (max_reg, l_reg, o_reg))
     # Store logsumexp in log2 domain to avoid conversion overhead in backward
     # logsumexp_log2 = max + log2(l) where max is already in log2 domain
     logsumexp_reg = max_reg + jnp.log2(l_reg)
@@ -289,14 +292,13 @@ def flash_attention_bwd_dkv_kernel(
 
     Grid: (batch*heads, num_kv_blocks)
     - Outer parallel dimension: KV blocks
-    - Inner loop: iterate over Q blocks that can attend to this KV block
+    - Inner loop: iterate over all Q blocks
 
     For each KV block, we accumulate:
         dV += P^T @ dO
         dK += dS^T @ Q  (where dS = P ⊙ (dP - D))
 
     Uses exp2 with log2(e) scaling for faster GPU execution.
-    For causal attention, uses tighter loop bounds to skip Q blocks that can't see this KV block.
     """
     k_reg = plgpu.load(k_ref.at[0, :, :])
     v_reg = plgpu.load(v_ref.at[0, :, :])
@@ -306,15 +308,6 @@ def flash_attention_bwd_dkv_kernel(
     dk_acc = jnp.zeros(dk_ref.shape, dtype=jnp.float32)
     dv_acc = jnp.zeros(dv_ref.shape, dtype=jnp.float32)
 
-    # For causal: Q block i can only see KV positions 0..(i+1)*BLOCK_R-1
-    # So KV block j is only visible to Q blocks where (i+1)*BLOCK_R > j*BLOCK_C
-    # i.e., i >= ceil(j*BLOCK_C / BLOCK_R) - 1 = floor((j*BLOCK_C - 1) / BLOCK_R)
-    # Simplify: start from Q block index floor(kv_blk_idx * BLOCK_C / BLOCK_R)
-    if CAUSAL:
-        q_blk_start = (kv_blk_idx * BLOCK_C) // BLOCK_R
-    else:
-        q_blk_start = 0
-
     def body(t, carry):
         dk_acc, dv_acc = carry
         idx = pl.dslice(t * BLOCK_R, BLOCK_R)
@@ -322,21 +315,34 @@ def flash_attention_bwd_dkv_kernel(
         do_blk = plgpu.load(do_ref.at[0, idx, :])
         logsumexp_blk = plgpu.load(logsumexp_ref.at[0, idx])
         d_blk = plgpu.load(d_ref.at[0, idx])
-        # Both s_blk and logsumexp are in log2 domain
-        s_blk = pl.dot(q_blk, k_reg, trans_b=True, precision='float32') * qk_scale
-        # Apply causal mask for partial blocks
-        if CAUSAL:
-            q_idx = BLOCK_R * t + jnp.arange(BLOCK_R)
-            mask = kv_idx[None, :] > q_idx[:, None]
-            s_blk = jnp.where(mask, -jnp.inf, s_blk)
-        p_blk = jnp.exp2(s_blk - logsumexp_blk[..., None])
-        dp_blk = pl.dot(do_blk, v_reg, trans_b=True)
-        ds_blk = p_blk * (dp_blk - d_blk[..., None]) * softmax_scale
-        dv_acc += pl.dot(p_blk.astype(do_blk.dtype), do_blk, trans_a=True)
-        dk_acc += pl.dot(ds_blk.astype(q_blk.dtype), q_blk, trans_a=True)
-        return (dk_acc, dv_acc)
 
-    dk_acc, dv_acc = jax.lax.fori_loop(q_blk_start, num_q_blocks, body, (dk_acc, dv_acc))
+        def compute_block(_):
+            # Both s_blk and logsumexp are in log2 domain
+            s_blk = pl.dot(q_blk, k_reg, trans_b=True, precision='float32') * qk_scale
+            # Apply causal mask for partial blocks
+            if CAUSAL:
+                q_idx = BLOCK_R * t + jnp.arange(BLOCK_R)
+                causal_mask = kv_idx[None, :] > q_idx[:, None]
+                s_blk_masked = jnp.where(causal_mask, -jnp.inf, s_blk)
+            else:
+                s_blk_masked = s_blk
+            p_blk = jnp.exp2(s_blk_masked - logsumexp_blk[..., None])
+            dp_blk = pl.dot(do_blk, v_reg, trans_b=True)
+            ds_blk = p_blk * (dp_blk - d_blk[..., None]) * softmax_scale
+            dv_new = dv_acc + pl.dot(p_blk.astype(do_blk.dtype), do_blk, trans_a=True)
+            dk_new = dk_acc + pl.dot(ds_blk.astype(q_blk.dtype), q_blk, trans_a=True)
+            return (dk_new, dv_new)
+
+        def skip_block(_):
+            return (dk_acc, dv_acc)
+
+        # For causal: skip Q blocks that can't see this KV block (t < kv_blk_idx)
+        if CAUSAL:
+            return jax.lax.cond(t < kv_blk_idx, skip_block, compute_block, None)
+        else:
+            return compute_block(None)
+
+    dk_acc, dv_acc = jax.lax.fori_loop(0, num_q_blocks, body, (dk_acc, dv_acc))
     plgpu.store(dk_ref, dk_acc.astype(dk_ref.dtype))
     plgpu.store(dv_ref, dv_acc.astype(dv_ref.dtype))
 
@@ -384,13 +390,12 @@ def flash_attention_bwd_dq_kernel(
 
     Grid: (batch*heads, num_q_blocks)
     - Outer parallel dimension: Q blocks
-    - Inner loop: iterate over KV blocks visible to this Q block
+    - Inner loop: iterate over all KV blocks
 
     For each Q block, we accumulate:
         dQ += dS @ K  (where dS = P ⊙ (dP - D))
 
     Uses exp2 with log2(e) scaling for faster GPU execution.
-    For causal attention, uses tighter loop bounds to skip KV blocks this Q can't see.
     """
     q_reg = plgpu.load(q_ref.at[0, :, :])
     do_reg = plgpu.load(do_ref.at[0, :, :])
@@ -400,33 +405,38 @@ def flash_attention_bwd_dq_kernel(
     q_idx = BLOCK_R * q_blk_idx + jnp.arange(BLOCK_R)
     dq_acc = jnp.zeros(dq_ref.shape, dtype=jnp.float32)  # Use float32 for numerical stability
 
-    # For causal: Q block i can only see KV positions 0..(i+1)*BLOCK_R-1
-    # So we only need KV blocks 0..ceil((i+1)*BLOCK_R / BLOCK_C)
-    if CAUSAL:
-        num_kv_blocks_actual = pl.cdiv((q_blk_idx + 1) * BLOCK_R, BLOCK_C)
-        num_kv_blocks_actual = jnp.minimum(num_kv_blocks_actual, num_kv_blocks)
-    else:
-        num_kv_blocks_actual = num_kv_blocks
-
     def body(t, carry):
         dq_acc = carry
         idx = pl.dslice(t * BLOCK_C, BLOCK_C)
         k_blk = plgpu.load(k_ref.at[0, idx, :])
         v_blk = plgpu.load(v_ref.at[0, idx, :])
-        # Both s_blk and logsumexp are in log2 domain
-        s_blk = pl.dot(q_reg, k_blk, trans_b=True, precision='float32') * qk_scale
-        # Apply causal mask for partial blocks
-        if CAUSAL:
-            kv_idx = BLOCK_C * t + jnp.arange(BLOCK_C)
-            mask = kv_idx[None, :] > q_idx[:, None]
-            s_blk = jnp.where(mask, -jnp.inf, s_blk)
-        p_blk = jnp.exp2(s_blk - logsumexp_reg[..., None])
-        dp_blk = pl.dot(do_reg, v_blk, trans_b=True)
-        ds_blk = p_blk * (dp_blk - d_reg[..., None]) * softmax_scale
-        dq_acc += pl.dot(ds_blk.astype(k_blk.dtype), k_blk)
-        return dq_acc
 
-    dq_acc = jax.lax.fori_loop(0, num_kv_blocks_actual, body, dq_acc)
+        def compute_block(_):
+            # Both s_blk and logsumexp are in log2 domain
+            s_blk = pl.dot(q_reg, k_blk, trans_b=True, precision='float32') * qk_scale
+            # Apply causal mask for partial blocks
+            if CAUSAL:
+                kv_idx = BLOCK_C * t + jnp.arange(BLOCK_C)
+                causal_mask = kv_idx[None, :] > q_idx[:, None]
+                s_blk_masked = jnp.where(causal_mask, -jnp.inf, s_blk)
+            else:
+                s_blk_masked = s_blk
+            p_blk = jnp.exp2(s_blk_masked - logsumexp_reg[..., None])
+            dp_blk = pl.dot(do_reg, v_blk, trans_b=True)
+            ds_blk = p_blk * (dp_blk - d_reg[..., None]) * softmax_scale
+            dq_new = dq_acc + pl.dot(ds_blk.astype(k_blk.dtype), k_blk)
+            return dq_new
+
+        def skip_block(_):
+            return dq_acc
+
+        # For causal: skip KV blocks this Q can't see (t > q_blk_idx)
+        if CAUSAL:
+            return jax.lax.cond(t > q_blk_idx, skip_block, compute_block, None)
+        else:
+            return compute_block(None)
+
+    dq_acc = jax.lax.fori_loop(0, num_kv_blocks, body, dq_acc)
     plgpu.store(dq_ref, dq_acc.astype(dq_ref.dtype))
 
 
