@@ -189,9 +189,9 @@ fi
 if ! command -v tmux &> /dev/null; then
     echo "Installing tmux..."
     if command -v apt-get &> /dev/null; then
-        sudo apt-get update && sudo apt-get install -y tmux
+        apt-get update && apt-get install -y tmux
     elif command -v yum &> /dev/null; then
-        sudo yum install -y tmux
+        yum install -y tmux
     elif command -v apk &> /dev/null; then
         apk add tmux
     else
