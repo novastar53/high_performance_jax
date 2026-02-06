@@ -336,8 +336,14 @@ def flash_attention_bwd_dkv_kernel(
                 q_idx = BLOCK_R * t + jnp.arange(BLOCK_R)
                 causal_mask = kv_idx[None, :] > q_idx[:, None]
                 s_blk_masked = jnp.where(causal_mask, -jnp.inf, s_blk)
-            else:
+            elif IS_BIDIRECTIONAL:
                 s_blk_masked = s_blk
+            else:
+                q_idx = BLOCK_R * t + jnp.arange(BLOCK_R)
+                mask = jnp.ones((BLOCK_R, BLOCK_C), dtype=jnp.bool_)
+                mask = mask & (q_idx[:, None] - WINDOW_SIZE[0] <= kv_idx[None, :])
+                mask = mask & (q_idx[:, None] + WINDOW_SIZE[1] >= kv_idx[None, :])
+                s_blk_masked = jnp.where(mask, s_blk, -jnp.inf)
             p_blk = jnp.exp(s_blk_masked - logsumexp_blk[..., None])
             dp_blk = pl.dot(do_blk, v_reg, trans_b=True)
             ds_blk = p_blk * (dp_blk - d_blk[..., None]) * softmax_scale
@@ -348,11 +354,15 @@ def flash_attention_bwd_dkv_kernel(
         def skip_block(_):
             return (dk_acc, dv_acc)
 
-        # For causal: skip Q blocks that can't see this KV block (t < kv_blk_idx)
+        # Skip blocks entirely outside the attention window
         if IS_CAUSAL:
             return jax.lax.cond(t < kv_blk_idx, skip_block, compute_block, None)
-        else:
+        elif IS_BIDIRECTIONAL:
             return compute_block(None)
+        else:
+            skip_right = t * BLOCK_R > kv_blk_idx * BLOCK_C + (BLOCK_C - 1) + WINDOW_SIZE[0]
+            skip_left = (t + 1) * BLOCK_R - 1 < kv_blk_idx * BLOCK_C - WINDOW_SIZE[1]
+            return jax.lax.cond(skip_right | skip_left, skip_block, compute_block, None)
 
     dk_acc, dv_acc = jax.lax.fori_loop(0, num_q_blocks, body, (dk_acc, dv_acc))
     plgpu.store(dk_ref, dk_acc.astype(dk_ref.dtype))
@@ -427,8 +437,14 @@ def flash_attention_bwd_dq_kernel(
                 kv_idx = BLOCK_C * t + jnp.arange(BLOCK_C)
                 causal_mask = kv_idx[None, :] > q_idx[:, None]
                 s_blk_masked = jnp.where(causal_mask, -jnp.inf, s_blk)
-            else:
+            elif IS_BIDIRECTIONAL:
                 s_blk_masked = s_blk
+            else:
+                kv_idx = BLOCK_C * t + jnp.arange(BLOCK_C)
+                mask = jnp.ones((BLOCK_R, BLOCK_C), dtype=jnp.bool_)
+                mask = mask & (q_idx[:, None] - WINDOW_SIZE[0] <= kv_idx[None, :])
+                mask = mask & (q_idx[:, None] + WINDOW_SIZE[1] >= kv_idx[None, :])
+                s_blk_masked = jnp.where(mask, s_blk, -jnp.inf)
             p_blk = jnp.exp(s_blk_masked - logsumexp_reg[..., None])
             dp_blk = pl.dot(do_reg, v_blk, trans_b=True)
             ds_blk = p_blk * (dp_blk - d_reg[..., None]) * softmax_scale
@@ -438,11 +454,15 @@ def flash_attention_bwd_dq_kernel(
         def skip_block(_):
             return dq_acc
 
-        # For causal: skip KV blocks this Q can't see (t > q_blk_idx)
+        # Skip blocks entirely outside the attention window
         if IS_CAUSAL:
             return jax.lax.cond(t > q_blk_idx, skip_block, compute_block, None)
-        else:
+        elif IS_BIDIRECTIONAL:
             return compute_block(None)
+        else:
+            skip_right = t * BLOCK_C > q_blk_idx * BLOCK_R + (BLOCK_R - 1) + WINDOW_SIZE[1]
+            skip_left = (t + 1) * BLOCK_C - 1 < q_blk_idx * BLOCK_R - WINDOW_SIZE[0]
+            return jax.lax.cond(skip_right | skip_left, skip_block, compute_block, None)
 
     dq_acc = jax.lax.fori_loop(0, num_kv_blocks, body, dq_acc)
     plgpu.store(dq_ref, dq_acc.astype(dq_ref.dtype))
