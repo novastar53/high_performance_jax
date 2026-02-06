@@ -122,8 +122,10 @@ def cudnn_attention(q, k, v):
     elif IS_BIDIRECTIONAL:
         out = jax.nn.dot_product_attention(q_t, k_t, v_t, implementation=JAX_SDPA_IMPL, is_causal=False)
     else:
-        print(WINDOW_SIZE)
-        out = jax.nn.dot_product_attention(q_t, k_t, v_t, implementation=JAX_SDPA_IMPL, local_window_size=WINDOW_SIZE) #, is_causal=Fal)
+        # cuDNN requires is_causal=True for backward-only sliding windows (right=0),
+        # otherwise it attends in both directions within the window.
+        is_causal = WINDOW_SIZE[1] == 0
+        out = jax.nn.dot_product_attention(q_t, k_t, v_t, implementation=JAX_SDPA_IMPL, local_window_size=WINDOW_SIZE, is_causal=is_causal)
     return jnp.transpose(out, (0, 2, 1, 3))  # Back to (B, H, T, D)
 
 
@@ -607,7 +609,6 @@ if __name__ == "__main__":
         o_flash_attn_jax = flash_attn_jax_wrapper(q, k, v)
         assert jnp.allclose(o_flash_attn_jax, o_ref, atol=1e-2, rtol=1e-2), \
             f"flash_attn_jax max diff: {jnp.max(jnp.abs(o_flash_attn_jax - o_ref))}"
-        print("flash_attn_jax reference check passed!")
 
     assert jnp.allclose(o_cudnn_ref, o_ref, atol=1e-1, rtol=1e-2),f"o max diff: {jnp.max(jnp.abs(o_cudnn_ref - o_ref))}"
     assert jnp.allclose(o_flash, o_cudnn_ref, atol=1e-1, rtol=1e-2), f"o max diff: {jnp.max(jnp.abs(o_flash - o_cudnn_ref))}"
