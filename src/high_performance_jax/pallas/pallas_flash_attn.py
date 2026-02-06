@@ -187,10 +187,14 @@ def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, qk_
                 s_blk_masked = jnp.where(mask, s_blk, -jnp.inf)
 
             max_blk = jnp.maximum(max_reg, jnp.max(s_blk_masked, axis=-1))
+            # When window_size < block_size, individual rows can be fully masked (-inf).
+            # exp(-inf - (-inf)) = exp(NaN) = NaN, so replace NaN with 0.
             p_blk = jnp.exp(s_blk_masked - max_blk[:, None])
+            p_blk = jnp.where(jnp.isnan(p_blk), 0.0, p_blk)
             l_blk = jnp.sum(p_blk, axis=-1)
             o_blk = pl.dot(p_blk.astype(v_blk.dtype), v_blk)
             alpha = jnp.exp(max_reg - max_blk)
+            alpha = jnp.where(jnp.isnan(alpha), 0.0, alpha)
             return (max_blk,
                     l_reg * alpha + l_blk,
                     o_reg * alpha[:, None] + o_blk)
@@ -572,7 +576,7 @@ if __name__ == "__main__":
     parser.add_argument("--block-c", type=int, default=BLOCK_C, help="Block size C (KV cols)")
     parser.add_argument("--num-warps", type=int, default=NUM_WARPS, help="Number of warps")
     parser.add_argument("--num-stages", type=int, default=NUM_STAGES, help="Number of pipeline stages")
-    parser.add_argument("--window-size", type=str, default=None, help="Sliding window as 'left,right' tuple (e.g., '-1,0' for causal, '64,64' for bidirectional)")
+    parser.add_argument("--window-size", type=str, default="-1,0", help="Sliding window as 'left,right' tuple (e.g., '-1,0' for causal, '64,64' for bidirectional)")
     parser.add_argument("--interpret-mode", action="store_true", help="Use Pallas interpreter mode")
     parser.add_argument("--batch-size", type=int, default=2, help="Batch size (B)")
     parser.add_argument("--num-heads", type=int, default=4, help="Number of heads (H)")
