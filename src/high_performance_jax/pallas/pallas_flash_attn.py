@@ -43,10 +43,10 @@ BLOCK_C = _args.block_c
 NUM_WARPS = _args.num_warps
 NUM_STAGES = _args.num_stages
 WINDOW_SIZE = _args.window_size
-if _args.window_size:
-    parts = _args.window_size.split(',')
-    WINDOW_SIZE = (int(parts[0].strip()), int(parts[1].strip()))
-IS_CAUSAL = WINDOW_SIZE is not None and WINDOW_SIZE[1] == 0
+parts = _args.window_size.split(',')
+WINDOW_SIZE = (int(parts[0].strip()), int(parts[1].strip()))
+IS_CAUSAL = (WINDOW_SIZE == (-1,0))
+IS_BIDIRECTIONAL = (WINDOW_SIZE == (-1,-1))
 
 DTYPE = jnp.bfloat16
 JAX_SDPA_IMPL = "cudnn"
@@ -71,7 +71,7 @@ def mha_reference(q, k, v):
     left, right = WINDOW_SIZE
     left_limit = None if left == -1 else left
     right_limit = None if right == -1 else right
-    if left_limit or right_limit:
+    if left_limit is not None or right_limit is not None:
         q_idx = jnp.arange(T)
         k_idx = jnp.arange(T)
         mask = jnp.ones((T, T), dtype=jnp.bool_)
@@ -92,7 +92,7 @@ def _compute_logsumexp(q, k):
     left, right = WINDOW_SIZE
     left_limit = None if left == -1 else left
     right_limit = None if right == -1 else right
-    if left_limit or right_limit:
+    if left_limit is not None or right_limit is not None:
         q_idx = jnp.arange(T)
         k_idx = jnp.arange(T)
         mask = jnp.ones((T, T), dtype=jnp.bool_)
@@ -117,14 +117,13 @@ def cudnn_attention(q, k, v):
     q_t = jnp.transpose(q, (0, 2, 1, 3))
     k_t = jnp.transpose(k, (0, 2, 1, 3))
     v_t = jnp.transpose(v, (0, 2, 1, 3))
-    is_causal = (WINDOW_SIZE == (-1,0))
-    is_bidirectional = (WINDOW_SIZE == (-1,-1))
-    if is_causal:
+    if IS_CAUSAL:
         out = jax.nn.dot_product_attention(q_t, k_t, v_t, implementation=JAX_SDPA_IMPL, is_causal=True)
-    elif is_bidirectional:
+    elif IS_BIDIRECTIONAL:
         out = jax.nn.dot_product_attention(q_t, k_t, v_t, implementation=JAX_SDPA_IMPL, is_causal=False)
     else:
-        out = jax.nn.dot_product_attention(q_t, k_t, v_t, implementation=JAX_SDPA_IMPL, local_window_size=WINDOW_SIZE)
+        print(WINDOW_SIZE)
+        out = jax.nn.dot_product_attention(q_t, k_t, v_t, implementation=JAX_SDPA_IMPL, local_window_size=WINDOW_SIZE) #, is_causal=Fal)
     return jnp.transpose(out, (0, 2, 1, 3))  # Back to (B, H, T, D)
 
 
@@ -145,11 +144,9 @@ def flash_attn_jax_wrapper(q, k, v):
     k_t = jnp.transpose(k, (0, 2, 1, 3))
     v_t = jnp.transpose(v, (0, 2, 1, 3))
 
-    is_causal = (WINDOW_SIZE == (-1,0))
-    is_bidirectional = (WINDOW_SIZE == (-1,-1))
-    if is_causal:
+    if IS_CAUSAL:
         out = flash_mha(q_t, k_t, v_t, is_causal=True)
-    elif is_bidirectional:
+    elif IS_BIDIRECTIONAL:
         out = flash_mha(q_t, k_t, v_t, is_causal=False)
     else:
         out = flash_mha(q_t, k_t, v_t, window_size=WINDOW_SIZE)
@@ -180,8 +177,15 @@ def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, qk_
                 kv_idx = BLOCK_C * t + jnp.arange(BLOCK_C)
                 causal_mask = kv_idx[None, :] > q_idx[:, None]
                 s_blk_masked = jnp.where(causal_mask, -jnp.inf, s_blk)
-            else:
+            elif IS_BIDIRECTIONAL:
                 s_blk_masked = s_blk
+            else:
+                kv_idx = BLOCK_C * t + jnp.arange(BLOCK_C)
+                mask = jnp.full((BLOCK_R, BLOCK_C), fill_value=True, dtype=jnp.bool)
+                mask = mask & (q_idx[:, None] - WINDOW_SIZE[0] <= kv_idx[None, :])
+                mask = mask & (q_idx[:, None] + WINDOW_SIZE[1] >= kv_idx[None, :])
+                s_blk_masked = jnp.where(mask, s_blk, -jnp.inf)
+
             max_blk = jnp.maximum(max_reg, jnp.max(s_blk_masked, axis=-1))
             p_blk = jnp.exp(s_blk_masked - max_blk[:, None])
             l_blk = jnp.sum(p_blk, axis=-1)
@@ -194,11 +198,15 @@ def flash_attention_fwd_kernel(q_ref, k_ref, v_ref, o_ref, logsumexp_ref, *, qk_
         def skip_block(_):
             return (max_reg, l_reg, o_reg)
 
-        # For causal: skip KV blocks that are entirely masked (t > blk_idx)
+        # Skip blocks entirely outside the attention window
         if IS_CAUSAL:
             return jax.lax.cond(t > blk_idx, skip_block, compute_block, None)
-        else:
+        elif IS_BIDIRECTIONAL:
             return compute_block(None)
+        else:
+            skip_right = t * BLOCK_C > blk_idx * BLOCK_R + (BLOCK_R - 1) + WINDOW_SIZE[1]
+            skip_left = (t + 1) * BLOCK_C - 1 < blk_idx * BLOCK_R - WINDOW_SIZE[0]
+            return jax.lax.cond(skip_right | skip_left, skip_block, compute_block, None)
 
     max_reg, l_reg, o_reg = jax.lax.fori_loop(0, num_k_blocks, body, (max_reg, l_reg, o_reg))
     logsumexp_reg = max_reg + jnp.log(l_reg)
@@ -568,6 +576,7 @@ if __name__ == "__main__":
     o_ref = mha_reference(q, k, v)
     logsumexp_ref = _compute_logsumexp(q, k)
     o_flash, logsumexp_flash = flash_attention_fwd(q, k, v)
+    o_cudnn_ref = cudnn_attention(q, k, v)
 
     # Test nshepperd/flash_attn_jax reference (skip in INTERPRET_MODE)
     if not INTERPRET_MODE:
@@ -576,8 +585,8 @@ if __name__ == "__main__":
             f"flash_attn_jax max diff: {jnp.max(jnp.abs(o_flash_attn_jax - o_ref))}"
         print("flash_attn_jax reference check passed!")
 
-    o_cudnn_ref = cudnn_attention(q, k, v)
     assert jnp.allclose(o_cudnn_ref, o_ref, atol=1e-1, rtol=1e-2),f"o max diff: {jnp.max(jnp.abs(o_cudnn_ref - o_ref))}"
+    assert jnp.allclose(o_flash, o_cudnn_ref, atol=1e-1, rtol=1e-2), f"o max diff: {jnp.max(jnp.abs(o_flash - o_cudnn_ref))}"
     assert jnp.allclose(o_flash, o_ref, atol=1e-1, rtol=1e-2), f"o max diff: {jnp.max(jnp.abs(o_flash - o_ref))}"
     assert jnp.allclose(logsumexp_flash, logsumexp_ref, atol=1e-2, rtol=1e-2), f"logsumexp max diff: {jnp.max(jnp.abs(logsumexp_flash - logsumexp_ref))}"
     print("Forward pass check passed!")
@@ -599,7 +608,6 @@ if __name__ == "__main__":
     assert jnp.allclose(d_flash, d_ref, atol=1e-1, rtol=1e-2), f"D max diff: {jnp.max(jnp.abs(d_flash - d_ref))}"
     print("Preprocess kernel (D) check passed!")
 
-    # Test backward pass
     dq_flash, dk_flash, dv_flash = flash_attention_bwd(q, k, v, o_flash, logsumexp_flash, do)
     assert jnp.allclose(dq_flash, dq_ref, atol=1e-1, rtol=1e-2), f"dQ max diff: {jnp.max(jnp.abs(dq_flash - dq_ref))}"
     assert jnp.allclose(dk_flash, dk_ref, atol=1e-1, rtol=1e-2), f"dK max diff: {jnp.max(jnp.abs(dk_flash - dk_ref))}"
