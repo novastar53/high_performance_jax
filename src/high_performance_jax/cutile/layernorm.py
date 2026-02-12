@@ -105,8 +105,6 @@ import pytest
 def test_cutile_layer_norm_jax():  
     # Device check  
     print(jax.devices())
-    if not jax.devices()[0].device_kind == 'cuda':  
-        pytest.skip('CUDA device required')  
   
     # Simple test shape  
     M, N = 128, 1024  
