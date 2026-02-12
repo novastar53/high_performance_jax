@@ -10,7 +10,7 @@ import math
   
 # DLPack helpers  
 def from_jax(x):  
-    return jax.dlpack.to_dlpack(x)  
+    return x.__dlpack__() 
   
 def to_jax(capsule, shape, dtype):  
     return jax.dlpack.from_dlpack(capsule)  
