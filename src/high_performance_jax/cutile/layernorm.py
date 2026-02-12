@@ -42,7 +42,7 @@ def cutile_layer_norm_jax(x, weight, bias, eps=1e-5):
     x_cap, w_cap, b_cap, y_cap, mean_cap, rstd_cap = map(  
         from_jax, (x, weight, bias, y, mean, rstd))  
   
-    stream = jax.devices()[0].device  # JAX default stream  
+    stream = jax.devices()[0]  # JAX default stream  
     grid_fwd = (M,)  
   
     cutile_ln_p.bind(x_cap, w_cap, b_cap, y_cap, mean_cap, rstd_cap,  
