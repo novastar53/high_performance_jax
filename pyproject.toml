@@ -27,6 +27,7 @@ dependencies = [
 [project.optional-dependencies]
 gpu = [
     "jax[cuda12]==0.8.3",
+    "cuda-tile",
     "triton>=3.3.0 ; sys_platform == 'linux'",
     "nvidia-cusparse>=12.7.2.19",
     "flash-attn-jax",
