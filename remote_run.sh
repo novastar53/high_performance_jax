@@ -210,7 +210,7 @@ fi
 # Install project dependencies
 echo "Ensuring dependencies are installed..."
 cd "\$REMOTE_DIR_EXPANDED"
-uv sync --extra gpu  || uv sync --extra tpu  || uv sync
+uv sync --extra gpu  
 
 echo "Remote setup complete!"
 REMOTE_SCRIPT
