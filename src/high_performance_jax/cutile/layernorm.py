@@ -1,6 +1,10 @@
 import jax  
 import jax.dlpack  
-from jax import core, custom_vjp  
+from jax import custom_vjp  
+try:  
+    from jax.extend import core  
+except ImportError:  
+    from jax import core
 import cuda.tile as ct  
 import math  
   
