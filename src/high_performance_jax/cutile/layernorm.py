@@ -1,4 +1,4 @@
-mport jax  
+import jax  
 import jax.dlpack  
 from jax import core, custom_vjp  
 import cuda.tile as ct  
