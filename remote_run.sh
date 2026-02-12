@@ -182,6 +182,7 @@ mkdir -p ~/.cache/jax_remote
 
 # Source uv environment
 if [ -f "\$HOME/.local/bin/env" ]; then
+    export TERM=xterm-256color
     source "\$HOME/.local/bin/env"
 fi
 
