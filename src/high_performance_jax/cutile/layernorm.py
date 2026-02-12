@@ -93,3 +93,56 @@ def cutile_bwd(res, grad_y_cap):
     return dx, final_dw, final_db, None  
   
 cutile_layer_norm_vjp.defvjp(cutile_fwd, cutile_bwd)
+
+
+import jax.numpy as jnp  
+import numpy as np  
+import pytest  
+  
+# Assume the corrected VJP implementation is available as cutile_layer_norm_vjp  
+# from your module (e.g., from cutile_layernorm import cutile_layer_norm_vjp)  
+  
+def test_cutile_layer_norm_jax():  
+    # Device check  
+    if not jax.devices()[0].device_kind == 'cuda':  
+        pytest.skip('CUDA device required')  
+  
+    # Simple test shape  
+    M, N = 128, 1024  
+    eps = 1e-5  
+    dtype = jnp.float32  
+  
+    key = jax.random.PRNGKey(0)  
+    x = jax.random.normal(key, (M, N), dtype=dtype)  
+    weight = jax.random.normal(jax.random.PRNGKey(1), (N,), dtype=dtype)  
+    bias = jax.random.normal(jax.random.PRNGKey(2), (N,), dtype=dtype)  
+  
+    # Forward pass via custom VJP  
+    y_cutile, _ = cutile_layer_norm_vjp(x, weight, bias, eps)  
+  
+    # Reference JAX LayerNorm  
+    def jax_layernorm(x, weight, bias, eps):  
+        mean = jnp.mean(x, axis=-1, keepdims=True)  
+        var = jnp.var(x, axis=-1, keepdims=True)  
+        rstd = jnp.rsqrt(var + eps)  
+        return (x - mean) * rstd * weight + bias  
+  
+    y_ref = jax_layernorm(x, weight, bias, eps)  
+  
+    # Validate forward  
+    np.testing.assert_allclose(y_cutile, y_ref, rtol=1e-4, atol=1e-4)  
+  
+    # Gradient check via VJP  
+    def loss_fn(y):  
+        return jnp.sum(y)  
+  
+    grad_cutile = jax.grad(lambda x, w, b: jnp.sum(cutile_layer_norm_vjp(x, w, b)[0]))(x, weight, bias)  
+    grad_ref = jax.grad(lambda x, w, b: jnp.sum(jax_layernorm(x, w, b, eps)))(x, weight, bias)  
+  
+    np.testing.assert_allclose(grad_cutile[0], grad_ref[0], rtol=1e-3, atol=1e-3)  
+    np.testing.assert_allclose(grad_cutile[1], grad_ref[1], rtol=1e-3, atol=1e-3)  
+    np.testing.assert_allclose(grad_cutile[2], grad_ref[2], rtol=1e-3, atol=1e-3)  
+  
+if __name__ == '__main__':  
+    test_cutile_layer_norm_jax()  
+    print('✅ JAX cuTile LayerNorm VJP test passed')
