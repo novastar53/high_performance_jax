@@ -20,7 +20,7 @@ cutile_ln_p = core.Primitive('cutile_layer_norm')
   
 def cutile_ln_impl(x_cap, w_cap, b_cap, y_cap, mean_cap, rstd_cap,  
                    *, eps, TILE_N, stream, grid_fwd):  
-    ct.launch(stream, grid_fwd, layer_norm_fwd,  
+    ct.launch(stream, grid_fwd, cutile_layer_norm_jax,  
               (x_cap, w_cap, b_cap, y_cap, mean_cap, rstd_cap, eps, TILE_N))  
     return []  
   
