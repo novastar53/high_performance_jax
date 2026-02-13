@@ -42,13 +42,13 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 # Check backend and set interpret mode for CPU
 if jax.default_backend() == 'cpu':
     # Modify INTERPRET_MODE for CPU execution
-    import high_performance_jax.pallas.pallas_flash_attn as flash_attn_module
+    import high_performance_jax.pallas.flash_attn as flash_attn_module
     flash_attn_module.INTERPRET_MODE = True
     flash_attention = flash_attn_module.flash_attention
     mha_reference = flash_attn_module.mha_reference
     cudnn_attention = flash_attn_module.cudnn_attention
 else:
-    from high_performance_jax.pallas.pallas_flash_attn import (
+    from high_performance_jax.pallas.flash_attn import (
         flash_attention,
         mha_reference,
         cudnn_attention,

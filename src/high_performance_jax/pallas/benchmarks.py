@@ -4,13 +4,13 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 
-from high_performance_jax.pallas.pallas_matmul_naive import matmul as pallas_matmul
-from high_performance_jax.pallas.pallas_softmax import manual_softmax, online_softmax, softmax
-from high_performance_jax.pallas.pallas_triton_matmul import DTYPE as TRITON_DTYPE
-from high_performance_jax.pallas.pallas_triton_matmul import _AUTOTUNE_CACHE as TRITON_AUTOTUNE_CACHE
-from high_performance_jax.pallas.pallas_triton_matmul import _COMPILED_CACHE as TRITON_COMPILED_CACHE
-from high_performance_jax.pallas.pallas_triton_matmul import _autotune_config as triton_autotune_config
-from high_performance_jax.pallas.pallas_triton_matmul import matmul as triton_matmul
+from high_performance_jax.pallas.matmul_naive import matmul as pallas_matmul
+from high_performance_jax.pallas.softmax import manual_softmax, online_softmax, softmax
+from high_performance_jax.pallas.triton_matmul import DTYPE as TRITON_DTYPE
+from high_performance_jax.pallas.triton_matmul import _AUTOTUNE_CACHE as TRITON_AUTOTUNE_CACHE
+from high_performance_jax.pallas.triton_matmul import _COMPILED_CACHE as TRITON_COMPILED_CACHE
+from high_performance_jax.pallas.triton_matmul import _autotune_config as triton_autotune_config
+from high_performance_jax.pallas.triton_matmul import matmul as triton_matmul
 
 
 def bench(fn, *args, iters=10):

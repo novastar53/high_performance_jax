@@ -29,7 +29,7 @@ from high_performance_jax.profiling import (
     print_traces,
     get_trace_dir,
 )
-from high_performance_jax.pallas.pallas_flash_attn import flash_attention, mha_reference, cudnn_attention
+from high_performance_jax.pallas.flash_attn import flash_attention, mha_reference, cudnn_attention
 
 # Load environment variables from .env file
 load_dotenv(Path(__file__).parent.parent / ".env")
